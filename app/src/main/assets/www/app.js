@@ -60,7 +60,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) saveN
 const R = {
   tab: 'edit', oi: null, connected: false, connecting: false, connErr: null, stats: null,
   ws: null, wsRetry: 0, gen: 0,
-  queue: { running: [], pending: [] }, history: [], mine: new Set(),
+  queue: { running: [], pending: [] }, history: [], remote: [], mine: new Set(),
   prog: null, previewUrl: null, results: [], shown: 0, fieldErrs: {},
 };
 const curServer = () => S.servers.find(s => s.id === S.activeServer) || null;
@@ -120,7 +120,7 @@ async function connect() {
   const gen = ++R.gen;
   if (R.ws) { try { R.ws.onclose = null; R.ws.close(); } catch (e) {} R.ws = null; }
   R.connected = false; R.oi = null; R.stats = null; R.connErr = null; R.prog = null;
-  R.queue = { running: [], pending: [] }; R.history = []; R.results = []; R.shown = 0; setPreview(null);
+  R.queue = { running: [], pending: [] }; R.history = []; R.remote = []; R.results = []; R.shown = 0; setPreview(null);
   if (!curServer()) { R.connecting = false; renderAll(); return; }
   R.connecting = true; renderAll();
   try {
@@ -133,7 +133,7 @@ async function connect() {
     if (oi.status !== 200 || !oi.data || typeof oi.data !== 'object') throw new Error('could not load node list (HTTP ' + oi.status + ')');
     R.oi = oi.data; R.connected = true; R.connecting = false;
     openWs(gen);
-    await Promise.all([refreshQueue(), refreshHistory()]);
+    await Promise.all([refreshQueue(), refreshHistory(), refreshRemote().catch(() => {})]);
   } catch (e) {
     if (gen !== R.gen) return;
     R.connecting = false; R.connErr = e.message;
@@ -281,10 +281,113 @@ function normalizePrompt(obj) {
   if (!ids.length || !ids.every(k => obj[k] && typeof obj[k] === 'object' && obj[k].class_type && obj[k].inputs)) throw new Error('This does not look like an API-format workflow.');
   return clone(obj);
 }
-function addWorkflow(name, prompt) {
-  const wf = { id: uid(), name: name || 'Workflow', prompt, pins: defaultPins(prompt), seedModes: {} };
+function addWorkflow(name, prompt, extra) {
+  const wf = Object.assign({ id: uid(), name: name || 'Workflow', prompt, pins: defaultPins(prompt), seedModes: {} }, extra || {});
   S.workflows.unshift(wf); S.activeWorkflow = wf.id; saveNow(); R.fieldErrs = {};
   switchTab('edit'); toast('Added "' + wf.name + '"');
+}
+
+// ---------- workflows saved on the server (editor format -> API format) ----------
+const VIRTUAL = new Set(['Reroute', 'PrimitiveNode', 'Note', 'MarkdownNote', 'SetNode', 'GetNode']);
+const CONTROL = new Set(['fixed', 'increment', 'decrement', 'randomize']);
+function widgetSpec(spec) {
+  if (!Array.isArray(spec)) return null;
+  const combo = Array.isArray(spec[0]); const t = combo ? 'COMBO' : spec[0]; const o = spec[1] || {};
+  if (o.forceInput || !['INT', 'FLOAT', 'STRING', 'BOOLEAN', 'COMBO'].includes(t)) return null;
+  const options = combo ? spec[0] : (o.options || []);
+  return { t, o, options, def: o.default !== undefined ? o.default : (t === 'COMBO' ? options[0] : undefined) };
+}
+function valueFits(w, v) {
+  if (w.t === 'INT' || w.t === 'FLOAT') return typeof v === 'number';
+  if (w.t === 'BOOLEAN') return typeof v === 'boolean';
+  if (w.t === 'STRING') return typeof v === 'string';
+  return (typeof v === 'string' || typeof v === 'number') && (!CONTROL.has(v) || w.options.includes(v));
+}
+function graphToPrompt(g) {
+  if (!R.oi) throw new Error('Connect to the server first.');
+  const nodes = Array.isArray(g.nodes) ? g.nodes : [];
+  const subIds = new Set(((g.definitions && g.definitions.subgraphs) || []).map(x => x.id));
+  if (nodes.some(n => subIds.has(n.type))) throw new Error('This workflow uses subgraphs, which this app cannot unpack yet.');
+  if (nodes.some(n => /^workflow[\/>]/.test(String(n.type)))) throw new Error('This workflow uses group nodes, which this app cannot unpack.');
+  const byId = new Map(nodes.map(n => [String(n.id), n]));
+  const links = new Map();
+  for (const l of (g.links || [])) { if (!l) continue; if (Array.isArray(l)) links.set(l[0], { from: String(l[1]), slot: l[2] }); else links.set(l.id, { from: String(l.origin_id), slot: l.origin_slot }); }
+  const setNodes = {}; for (const n of nodes) if (n.type === 'SetNode' && Array.isArray(n.widgets_values)) setNodes[n.widgets_values[0]] = n;
+  const missing = new Set();
+  const firstIn = n => n.inputs && n.inputs[0] ? n.inputs[0].link : null;
+  const resolve = (linkId, depth) => {
+    if (linkId == null || depth > 60) return null;
+    const l = links.get(linkId); const n = l && byId.get(l.from);
+    if (!n || n.mode === 2) return null;
+    if (n.type === 'Reroute' || n.type === 'SetNode') return resolve(firstIn(n), depth + 1);
+    if (n.type === 'GetNode') { const sn = setNodes[(n.widgets_values || [])[0]]; return sn ? resolve(firstIn(sn), depth + 1) : null; }
+    if (n.type === 'PrimitiveNode') { const v = (n.widgets_values || [])[0]; return v === undefined ? null : { value: v }; }
+    if (n.mode === 4) { // bypassed: pass the matching input straight through
+      const t = ((n.outputs || [])[l.slot] || {}).type; const ins = n.inputs || [];
+      const inp = (ins[l.slot] && ins[l.slot].type === t) ? ins[l.slot] : ins.find(i => i.type === t);
+      return inp ? resolve(inp.link, depth + 1) : null;
+    }
+    if (!R.oi[n.type]) { missing.add(n.type); return null; }
+    return { link: [String(n.id), l.slot] };
+  };
+  const out = {}, seedModes = {};
+  for (const n of nodes) {
+    if (n.mode === 2 || n.mode === 4 || VIRTUAL.has(n.type)) continue;
+    const ci = R.oi[n.type]; if (!ci) continue; // unknown: only an error if something real depends on it
+    const id = String(n.id); const inputs = {};
+    const spec = Object.assign({}, ci.input && ci.input.required, ci.input && ci.input.optional);
+    const wv = n.widgets_values;
+    if (wv && typeof wv === 'object' && !Array.isArray(wv)) { for (const name in spec) if (widgetSpec(spec[name]) && name in wv) inputs[name] = wv[name]; }
+    else {
+      const vals = Array.isArray(wv) ? wv : []; let i = 0;
+      for (const name in spec) {
+        const w = widgetSpec(spec[name]); if (!w) continue;
+        let j = i; while (j < vals.length && j < i + 3 && !valueFits(w, vals[j])) j++;
+        if (j < vals.length && valueFits(w, vals[j])) { inputs[name] = vals[j]; i = j + 1; }
+        else if (w.def !== undefined) inputs[name] = w.def;
+        if (w.t !== 'STRING' && w.t !== 'BOOLEAN' && typeof vals[i] === 'string' && CONTROL.has(vals[i]) && !(w.t === 'COMBO' && !w.o.control_after_generate)) {
+          if (w.t === 'INT') seedModes[id + '.' + name] = vals[i] === 'fixed' ? 'fixed' : 'random';
+          i++;
+        }
+      }
+    }
+    for (const inp of (n.inputs || [])) {
+      if (inp.link == null) continue;
+      const name = (inp.widget && inp.widget.name) || inp.name; const r = resolve(inp.link, 0);
+      if (!r) { if (!inp.widget) delete inputs[name]; }
+      else if (r.link) inputs[name] = r.link; else inputs[name] = r.value;
+    }
+    out[id] = { inputs, class_type: n.type, _meta: { title: n.title || ci.display_name || n.type } };
+  }
+  if (missing.size) throw new Error('It needs node types that are not installed on this server: ' + [...missing].join(', '));
+  for (const id in out) for (const k in out[id].inputs) { const v = out[id].inputs[k]; if (isLink(v) && !out[v[0]]) delete out[id].inputs[k]; }
+  if (!Object.keys(out).length) throw new Error('No runnable nodes were found in this workflow.');
+  return { prompt: out, seedModes };
+}
+async function refreshRemote() {
+  const r = await api('GET', '/api/userdata?dir=workflows&recurse=true&split=false&full_info=true');
+  if (r.status !== 200 || !Array.isArray(r.data)) { R.remote = []; return; }
+  R.remote = r.data.map(x => typeof x === 'string' ? x : (x && x.path)).filter(p => p && /\.json$/i.test(p)).map(p => {
+    p = p.replace(/\\/g, '/'); const i = p.lastIndexOf('/');
+    return { path: p, name: p.slice(i + 1).replace(/\.json$/i, ''), dir: i >= 0 ? p.slice(0, i) : '' };
+  }).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }));
+}
+const linkedWf = path => S.workflows.find(w => w.src && w.src.server === S.activeServer && w.src.path === path) || null;
+function openRemote(it) {
+  const wf = linkedWf(it.path);
+  if (wf) { S.activeWorkflow = wf.id; R.fieldErrs = {}; save(); switchTab('edit'); } else pullRemote(it, null);
+}
+async function pullRemote(it, existing) {
+  toast('Opening ' + it.name + '…');
+  try {
+    const r = await api('GET', '/api/userdata/' + encodeURIComponent('workflows/' + it.path));
+    if (r.status !== 200 || !r.data || typeof r.data !== 'object') throw new Error('The server could not send the file (HTTP ' + r.status + ').');
+    const c = Array.isArray(r.data.nodes) ? graphToPrompt(r.data) : { prompt: normalizePrompt(r.data), seedModes: {} };
+    if (existing) { existing.prompt = c.prompt; existing.seedModes = c.seedModes; existing.pins = defaultPins(c.prompt); S.activeWorkflow = existing.id; saveNow(); R.fieldErrs = {}; switchTab('edit'); toast('Reloaded from the rig'); }
+    else addWorkflow(it.name, c.prompt, { seedModes: c.seedModes, src: { server: S.activeServer, path: it.path } });
+  } catch (e) {
+    openSheet('Could not open "' + it.name + '"', [h('div', { class: 'note bad' }, e.message), h('div', { class: 'dim small' }, 'You can still use it: run it once in ComfyUI on the PC, then add it here from Add workflow > From recent runs.')]);
+  }
 }
 
 // ---------- sheets ----------
@@ -333,19 +436,34 @@ function statusChip() {
 function page(view, ...kids) { const v = $('#v-' + view); v.textContent = ''; v.append(h('div', { class: 'scroll' }, h('div', { class: 'wrap' }, kids))); }
 
 // ---------- workflows tab ----------
-function renderWorkflows() {
-  const list = S.workflows.map(wf => h('div', { class: 'card wf' + (wf.id === S.activeWorkflow ? ' sel' : '') },
+function wfCard(wf) {
+  return h('div', { class: 'card wf' + (wf.id === S.activeWorkflow ? ' sel' : '') },
     h('div', { class: 'tap', onclick: () => { S.activeWorkflow = wf.id; R.fieldErrs = {}; save(); switchTab('edit'); } },
       h('div', { class: 'name' }, wf.name),
       h('div', { class: 'dim small' }, Object.keys(wf.prompt).length + ' nodes' + (promptText(wf.prompt) ? ' · ' + promptText(wf.prompt).slice(0, 70) : ''))),
     h('div', { class: 'acts' },
       h('button', { class: 'btn', onclick: () => askText('Rename workflow', 'Name', wf.name, v => { wf.name = v; saveNow(); renderWorkflows(); }) }, 'Rename'),
-      h('button', { class: 'btn', onclick: () => { const c = clone(wf); c.id = uid(); c.name = wf.name + ' copy'; S.workflows.splice(S.workflows.indexOf(wf) + 1, 0, c); saveNow(); renderWorkflows(); } }, 'Duplicate'),
-      h('button', { class: 'btn danger', onclick: () => confirmSheet('Delete workflow', 'Remove "' + wf.name + '" from this app? Nothing on the server is touched.', 'Delete', () => { S.workflows = S.workflows.filter(w => w !== wf); if (S.activeWorkflow === wf.id) S.activeWorkflow = S.workflows[0] ? S.workflows[0].id : null; saveNow(); renderWorkflows(); }) }, 'Delete'))));
+      h('button', { class: 'btn', onclick: () => { const c = clone(wf); c.id = uid(); c.name = wf.name + ' copy'; delete c.src; S.workflows.splice(S.workflows.indexOf(wf) + 1, 0, c); saveNow(); renderWorkflows(); } }, 'Duplicate'),
+      h('button', { class: 'btn danger', onclick: () => confirmSheet('Delete workflow', 'Remove "' + wf.name + '" from this app? Nothing on the server is touched.', 'Delete', () => { S.workflows = S.workflows.filter(w => w !== wf); if (S.activeWorkflow === wf.id) S.activeWorkflow = S.workflows[0] ? S.workflows[0].id : null; saveNow(); renderWorkflows(); }) }, 'Delete')));
+}
+function renderWorkflows() {
+  const srv = curServer();
+  const remote = R.remote.map(it => { const wf = linkedWf(it.path);
+    return h('div', { class: 'card wf' + (wf && wf.id === S.activeWorkflow ? ' sel' : '') },
+      h('div', { class: 'row' },
+        h('div', { class: 'grow tap', onclick: () => openRemote(it) }, h('div', { class: 'name' }, it.name),
+          h('div', { class: 'dim small' }, (it.dir ? it.dir + ' · ' : '') + (wf ? 'Opened · keeps the settings you changed here' : 'Tap to open'))),
+        wf ? h('button', { class: 'btn', style: 'min-height:42px;font-size:14px;padding:0 12px', onclick: () => confirmSheet('Reload from the rig', 'Replace the settings you changed on the phone with the version of "' + it.name + '" saved on the rig?', 'Reload', () => pullRemote(it, wf)) }, 'Reload') : null)); });
+  const local = S.workflows.filter(w => !(w.src && w.src.server === S.activeServer && R.remote.some(it => it.path === w.src.path))).map(wfCard);
   page('workflows',
     h('div', { class: 'edit-head' }, h('h1', null, 'Workflows'), statusChip()),
-    h('button', { class: 'btn primary block', style: 'margin-bottom:14px', onclick: addWorkflowSheet }, icon('plus'), 'Add workflow'),
-    list.length ? list : h('div', { class: 'empty' }, 'No workflows yet. Run one on the PC, then tap Add workflow and pick it from Recent runs.'));
+    srv && R.connected ? [
+      h('div', { class: 'row' }, h('h2', { class: 'grow' }, 'Saved on ' + srv.name), h('button', { class: 'btn icon', style: 'border:0;background:none', 'aria-label': 'Refresh list', onclick: () => refreshRemote().then(() => { renderWorkflows(); toast('List updated'); }).catch(e => toast(e.message, true)) }, icon('refresh'))),
+      remote.length ? remote : h('div', { class: 'dim small', style: 'margin:0 2px 10px' }, 'No saved workflows were found on this server.')] : null,
+    h('h2', null, 'On this phone'),
+    local,
+    local.length || remote.length ? null : h('div', { class: 'dim small', style: 'margin:0 2px 12px' }, R.connected ? 'Nothing here yet.' : 'Connect to a server to see its saved workflows.'),
+    h('button', { class: 'btn block', onclick: addWorkflowSheet }, icon('plus'), 'Add from recent runs or a file'));
 }
 function addWorkflowSheet() {
   const file = h('input', { type: 'file', accept: 'application/json,.json', style: 'display:none', onchange: () => {
@@ -502,28 +620,39 @@ function parseImageRef(v) {
 }
 function imageEl(wf, key, info, v, set) {
   const thumb = h('img', { class: 'thumb', alt: '' });
-  const show = val => { if (val && base()) thumb.src = viewUrl(parseImageRef(val), true); };
-  show(v);
-  const change = val => { set(val); show(val); renderEdit(); };
+  if (v && base()) thumb.src = viewUrl(parseImageRef(v), true);
+  const change = val => { set(val); renderEdit(); };
   const file = h('input', { type: 'file', accept: 'image/*', style: 'display:none', onchange: async () => {
     const f = file.files[0]; if (!f) return;
     if (!R.connected) { toast('Not connected', true); return; }
     toast('Uploading…');
-    try { const r = await uploadImage(f); const val = (r.subfolder ? r.subfolder + '/' : '') + r.name; if (R.oi) for (const c in R.oi) { /* keep menus in sync */ const req = R.oi[c].input && R.oi[c].input.required; if (req && req.image && Array.isArray(req.image[0]) && req.image[1] && req.image[1].image_upload && !req.image[0].includes(val)) req.image[0].unshift(val); } change(val); toast('Uploaded'); }
+    try { const r = await uploadImage(f); const val = (r.subfolder ? r.subfolder + '/' : '') + r.name; if (!info.options.includes(val)) info.options.unshift(val); change(val); toast('Uploaded'); }
     catch (e) { toast('Upload failed: ' + e.message, true); }
   } });
+  const ref = parseImageRef(v);
+  thumb.addEventListener('click', () => pickImageSheet(info.options, change));
   return h('div', { class: 'imgfield' }, thumb,
     h('div', { class: 'side' },
-      comboEl(info.options, v, val => { set(val); show(val); }, / \[(input|output|temp)\]$/.test(String(v))),
+      h('div', { class: 'fname' }, ref.filename || 'No image chosen', ref.type !== 'input' ? h('span', { class: 'dim' }, '  (' + ref.type + ')') : null),
       h('div', { class: 'row' },
-        h('button', { class: 'btn', onclick: () => file.click() }, 'Upload'),
-        h('button', { class: 'btn', onclick: () => pickOutputSheet(val => change(val)) }, 'From outputs')),
+        h('button', { class: 'btn', onclick: () => pickImageSheet(info.options, change) }, 'Choose'),
+        h('button', { class: 'btn', onclick: () => file.click() }, 'Upload')),
       file));
 }
-function pickOutputSheet(cb) {
-  const imgs = []; for (const e of R.history) for (const m of e.media) if (!m.video) imgs.push(m);
-  if (!imgs.length) { toast('No output images in the server history yet'); return; }
-  openSheet('Use an output as input', h('div', { class: 'grid' }, imgs.slice(0, 90).map(m => h('div', { class: 'cell', onclick: () => { closeSheet(); cb(outputRef(m)); } }, h('img', { src: viewUrl(m, true), loading: 'lazy' })))));
+const isImageName = n => /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(String(n));
+function pickImageSheet(options, cb) {
+  const inputs = options.filter(isImageName).map(o => Object.assign(parseImageRef(o), { ref: o }));
+  const outputs = []; for (const e of R.history) for (const m of e.media) if (!m.video) outputs.push(Object.assign({ ref: outputRef(m) }, m));
+  const grid = h('div', { class: 'grid' }); const seg = h('div', { class: 'seg' });
+  const show = which => {
+    seg.textContent = ''; grid.textContent = '';
+    for (const [id, label, n] of [['in', 'Inputs', inputs.length], ['out', 'Outputs', outputs.length]]) seg.append(h('button', { class: which === id ? 'on' : '', onclick: () => show(id) }, label + ' (' + n + ')'));
+    const list = (which === 'in' ? inputs : outputs).slice(0, 600);
+    if (!list.length) grid.append(h('div', { class: 'dim', style: 'grid-column:1/-1;padding:30px 0;text-align:center' }, which === 'in' ? 'The input folder on this server has no images.' : 'No output images in the server history yet.'));
+    for (const m of list) grid.append(h('div', { class: 'cell', onclick: () => { closeSheet(); cb(m.ref); } }, h('img', { src: viewUrl(m, true), loading: 'lazy', alt: m.filename }), h('div', { class: 'cap' }, m.filename)));
+  };
+  show('in');
+  openSheet('Choose image', [seg, grid]);
 }
 const outputRef = m => (m.subfolder ? m.subfolder + '/' : '') + m.filename + ' [' + m.type + ']';
 

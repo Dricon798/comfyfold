@@ -21,12 +21,12 @@ To build locally instead: open the folder in Android Studio and run the `app` co
 ## Using it
 
 1. **Server** tab: add each machine by address, e.g. `100.101.102.103:8188`.
-2. Run the workflow once in ComfyUI on the PC.
-3. **Workflows > Add workflow > From recent runs**, pick that run, give it a name.
-4. **Edit** tab: change prompts and settings, tap **Generate**. Star a setting to pin it to Main.
+2. **Workflows** tab: everything saved in ComfyUI on that machine is listed by name. Tap one to open it.
+3. **Edit** tab: change prompts and settings, tap **Generate**. Star a setting to pin it to Main.
 
-Workflows can also be imported from a file saved with ComfyUI's *Export (API)*. The normal
-"Save" format from the ComfyUI editor is not supported.
+Saved workflows are converted from ComfyUI's editor format on the phone. Workflows that use
+subgraphs or group nodes cannot be converted; for those, run the workflow once on the PC and
+add it with **Add from recent runs or a file**.
 
 ## Layout
 
