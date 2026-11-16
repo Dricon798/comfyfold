@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'app.comfyfold'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'app.comfyfold'
+        minSdk 33
+        targetSdk 35
+        // Every GitHub build gets a higher number so it installs over the previous one.
+        versionCode((System.getenv('GITHUB_RUN_NUMBER') ?: '1') as Integer)
+        versionName '0.1.' + (System.getenv('GITHUB_RUN_NUMBER') ?: '0')
+    }
+
+    signingConfigs {
+        // Fixed key kept in the repo so every build has the same signature and updates
+        // install over the old version without wiping saved workflows. Keep the repo private.
+        debug {
+            storeFile rootProject.file('signing/comfyfold.keystore')
+            storePassword 'comfyfold'
+            keyAlias 'comfyfold'
+            keyPassword 'comfyfold'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.13.1'
+}

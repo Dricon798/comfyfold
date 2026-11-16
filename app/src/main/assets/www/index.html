@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>ComfyFold</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <main id="main">
+    <section id="v-workflows" class="view" hidden></section>
+    <section id="v-edit" class="view" hidden>
+      <aside id="preview-pane"></aside>
+      <div id="edit-form" class="scroll"></div>
+      <div id="runbar"></div>
+    </section>
+    <section id="v-queue" class="view" hidden></section>
+    <section id="v-gallery" class="view" hidden></section>
+    <section id="v-settings" class="view" hidden></section>
+  </main>
+  <nav id="tabs"></nav>
+</div>
+<div id="sheets"></div>
+<div id="viewer" hidden></div>
+<div id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
