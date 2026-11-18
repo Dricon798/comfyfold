@@ -86,21 +86,33 @@ async function api(method, path, json) {
   let data = null; try { data = r.text ? JSON.parse(r.text) : null; } catch (e) { data = r.text; }
   return { status: r.status, data };
 }
-function uploadImage(file) {
-  const url = base() + '/upload/image';
-  if (bridge) return new Promise((res, rej) => {
-    const fr = new FileReader();
-    fr.onerror = () => rej(new Error('could not read file'));
-    fr.onload = () => {
-      const b64 = String(fr.result).split(',')[1] || '';
+function blobToB64(blob) {
+  return new Promise((res, rej) => { const fr = new FileReader(); fr.onerror = () => rej(new Error('could not read file')); fr.onload = () => res(String(fr.result).split(',')[1] || ''); fr.readAsDataURL(blob); });
+}
+// multipart POST: one file part named "image" plus plain text fields
+async function uploadForm(path, blob, filename, fields) {
+  const url = base() + path;
+  if (bridge) {
+    const b64 = await blobToB64(blob);
+    return new Promise((res, rej) => {
       const id = 'r' + (++cbSeq);
       cbs[id] = r => { try { if (r.status !== 200) throw new Error(r.text || ('HTTP ' + r.status)); res(JSON.parse(r.text)); } catch (e) { rej(e); } };
-      bridge.upload(id, url, b64, file.name || 'photo.jpg', file.type || 'image/jpeg');
-    };
-    fr.readAsDataURL(file);
+      bridge.uploadForm(id, url, b64, filename, blob.type || 'application/octet-stream', JSON.stringify(fields || {}));
+    });
+  }
+  const fd = new FormData(); fd.append('image', blob, filename); for (const k in (fields || {})) fd.append(k, fields[k]);
+  const r = await fetch(url, { method: 'POST', body: fd }); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json();
+}
+const uploadImage = file => uploadForm('/upload/image', file, file.name || 'photo.jpg', { type: 'input' });
+// binary GET returned as a data: URL, so the pixels can be read on a canvas
+function fetchDataUrl(url) {
+  if (bridge) return new Promise((res, rej) => {
+    const id = 'r' + (++cbSeq);
+    cbs[id] = r => r.status === 200 ? res(r.text) : rej(new Error(r.status ? 'HTTP ' + r.status : r.text));
+    bridge.fetchDataUrl(id, url);
   });
-  const fd = new FormData(); fd.append('image', file, file.name || 'photo.jpg'); fd.append('type', 'input');
-  return fetch(url, { method: 'POST', body: fd }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+  return fetch(url).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
+    .then(b => new Promise((res, rej) => { const fr = new FileReader(); fr.onerror = rej; fr.onload = () => res(String(fr.result)); fr.readAsDataURL(b); }));
 }
 function normUrl(u) {
   u = (u || '').trim().replace(/\/+$/, '');
@@ -633,10 +645,11 @@ function imageEl(wf, key, info, v, set) {
   thumb.addEventListener('click', () => pickImageSheet(info.options, change));
   return h('div', { class: 'imgfield' }, thumb,
     h('div', { class: 'side' },
-      h('div', { class: 'fname' }, ref.filename || 'No image chosen', ref.type !== 'input' ? h('span', { class: 'dim' }, '  (' + ref.type + ')') : null),
+      h('div', { class: 'fname' }, isMaskRef(ref) ? h('span', { class: 'mtag' }, 'Masked') : null, isMaskRef(ref) ? ' ' : null, ref.filename || 'No image chosen', ref.type !== 'input' ? h('span', { class: 'dim' }, '  (' + ref.type + ')') : null),
       h('div', { class: 'row' },
         h('button', { class: 'btn', onclick: () => pickImageSheet(info.options, change) }, 'Choose'),
-        h('button', { class: 'btn', onclick: () => file.click() }, 'Upload')),
+        h('button', { class: 'btn', onclick: () => file.click() }, 'Upload'),
+        h('button', { class: 'btn', disabled: !v, onclick: () => openMasker(ref, val => { if (!info.options.includes(val.replace(/ \[input\]$/, ''))) info.options.unshift(val.replace(/ \[input\]$/, '')); change(val); }) }, 'Mask')),
       file));
 }
 const isImageName = n => /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(String(n));
@@ -831,8 +844,133 @@ function serverSheet(sv) {
     } }, 'Save')]);
 }
 
+
+// ---------- mask editor ----------
+// ComfyUI convention: LoadImage turns transparent pixels into the MASK output (mask = 1 - alpha).
+// We paint on our own canvas, then POST it to /upload/mask with original_ref; the server copies our
+// alpha channel onto the original image and saves it as input/clipspace/<name>.png.
+const isMaskRef = ref => ref.subfolder === 'clipspace' && /^clipspace-mask-/.test(ref.filename);
+const M = { open: false };
+async function openMasker(ref, onDone) {
+  if (!R.connected) { toast('Not connected', true); return; }
+  if (!ref.filename) return;
+  const q = (ch) => base() + '/view?filename=' + encodeURIComponent(ref.filename) + '&subfolder=' + encodeURIComponent(ref.subfolder || '') + '&type=' + encodeURIComponent(ref.type || 'input') + '&channel=' + ch;
+  const root = $('#masker'); root.textContent = ''; root.hidden = false; M.open = true;
+  root.append(h('div', { class: 'mk-loading' }, 'Loading image…'));
+  let rgb, alpha;
+  try {
+    const [rgbUrl, aUrl] = await Promise.all([fetchDataUrl(q('rgb')), fetchDataUrl(q('a'))]);
+    [rgb, alpha] = await Promise.all([loadImg(rgbUrl), loadImg(aUrl)]);
+  } catch (e) { closeMasker(); toast('Could not load the image: ' + e.message, true); return; }
+  if (!M.open) return;
+  buildMasker(root, ref, rgb, alpha, onDone);
+}
+const loadImg = src => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('bad image data')); i.src = src; });
+function closeMasker() { M.open = false; const r = $('#masker'); r.hidden = true; r.textContent = ''; }
+function buildMasker(root, ref, rgb, alpha, onDone) {
+  const W = rgb.naturalWidth, H = rgb.naturalHeight;
+  const base = h('canvas', { class: 'mk-base', width: W, height: H });
+  base.getContext('2d').drawImage(rgb, 0, 0);
+  const mask = h('canvas', { class: 'mk-mask', width: W, height: H });
+  const mx = mask.getContext('2d', { willReadFrequently: true });
+  // existing mask: transparent in the original = masked
+  { const t = h('canvas', { width: W, height: H }); const tx = t.getContext('2d'); tx.drawImage(alpha, 0, 0, W, H);
+    const src = tx.getImageData(0, 0, W, H).data; const out = mx.createImageData(W, H); const d = out.data; let any = false;
+    for (let i = 0; i < d.length; i += 4) { const a = 255 - src[i + 3]; if (a) { any = true; d[i] = 255; d[i + 1] = 40; d[i + 2] = 60; d[i + 3] = a; } }
+    if (any) mx.putImageData(out, 0, 0); }
+  const layer = h('div', { class: 'mk-layer', style: 'width:' + W + 'px;height:' + H + 'px' }, base, mask);
+  const ring = h('div', { class: 'mk-ring', hidden: true });
+  const stage = h('div', { class: 'mk-stage' }, layer, ring);
+  const st = { tool: 'brush', size: 40, s: 1, tx: 0, ty: 0, undo: [], dirty: false, shown: true };
+  const MAXU = 20;
+  const apply = () => { layer.style.transform = 'translate(' + st.tx + 'px,' + st.ty + 'px) scale(' + st.s + ')'; };
+  const fit = () => { const r = stage.getBoundingClientRect(); st.s = Math.min(r.width / W, r.height / H) * 0.96; st.tx = (r.width - W * st.s) / 2; st.ty = (r.height - H * st.s) / 2; apply(); };
+  const snap = () => { st.undo.push(mx.getImageData(0, 0, W, H)); if (st.undo.length > MAXU) st.undo.shift(); updUndo(); };
+  const toImg = (cx, cy) => { const r = stage.getBoundingClientRect(); return { x: (cx - r.left - st.tx) / st.s, y: (cy - r.top - st.ty) / st.s }; };
+  const showRing = (cx, cy) => { const r = stage.getBoundingClientRect(); ring.hidden = false; ring.style.width = ring.style.height = st.size + 'px'; ring.style.left = (cx - r.left - st.size / 2) + 'px'; ring.style.top = (cy - r.top - st.size / 2) + 'px'; };
+  const dab = (a, b) => {
+    mx.save(); mx.globalCompositeOperation = st.tool === 'erase' ? 'destination-out' : 'source-over';
+    mx.strokeStyle = mx.fillStyle = 'rgb(255,40,60)'; mx.lineCap = mx.lineJoin = 'round'; mx.lineWidth = st.size / st.s;
+    mx.beginPath(); mx.moveTo(a.x, a.y); mx.lineTo(b.x, b.y); mx.stroke();
+    mx.beginPath(); mx.arc(b.x, b.y, st.size / st.s / 2, 0, Math.PI * 2); mx.fill(); mx.restore();
+  };
+  // pointers: one finger paints, two fingers pan and zoom
+  const pts = new Map(); let stroke = null, pinch = null;
+  stage.addEventListener('pointerdown', e => {
+    stage.setPointerCapture(e.pointerId); pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 1 && e.button === 0) {
+      snap(); const p = toImg(e.clientX, e.clientY); stroke = { last: p, moved: false }; dab(p, p); st.dirty = true; showRing(e.clientX, e.clientY);
+    } else if (pts.size === 2) {
+      if (stroke) { const u = st.undo.pop(); if (u) mx.putImageData(u, 0, 0); updUndo(); stroke = null; } // second finger: cancel the stroke
+      ring.hidden = true; const [a, b] = [...pts.values()];
+      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, s: st.s, tx: st.tx, ty: st.ty };
+    }
+  });
+  stage.addEventListener('pointermove', e => {
+    const p0 = pts.get(e.pointerId); if (!p0) { if (e.pointerType === 'mouse') showRing(e.clientX, e.clientY); return; }
+    p0.x = e.clientX; p0.y = e.clientY;
+    if (pinch && pts.size >= 2) {
+      const [a, b] = [...pts.values()]; const r = stage.getBoundingClientRect();
+      const ns = Math.max(0.05, Math.min(40, pinch.s * Math.hypot(a.x - b.x, a.y - b.y) / pinch.d));
+      const mxp = (a.x + b.x) / 2, myp = (a.y + b.y) / 2;
+      const ix = (pinch.mx - r.left - pinch.tx) / pinch.s, iy = (pinch.my - r.top - pinch.ty) / pinch.s;
+      st.s = ns; st.tx = mxp - r.left - ix * ns; st.ty = myp - r.top - iy * ns; apply();
+    } else if (stroke) {
+      const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+      for (const ce of (evs.length ? evs : [e])) { const p = toImg(ce.clientX, ce.clientY); dab(stroke.last, p); stroke.last = p; }
+      showRing(e.clientX, e.clientY);
+    }
+  });
+  const up = e => { if (!pts.has(e.pointerId)) return; pts.delete(e.pointerId); if (pts.size < 2) pinch = null; if (!pts.size) { stroke = null; if (e.pointerType !== 'mouse') ring.hidden = true; } };
+  stage.addEventListener('pointerup', up); stage.addEventListener('pointercancel', up);
+  stage.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse' && !pts.size) ring.hidden = true; });
+  stage.addEventListener('wheel', e => { e.preventDefault(); const r = stage.getBoundingClientRect(); const ix = (e.clientX - r.left - st.tx) / st.s, iy = (e.clientY - r.top - st.ty) / st.s;
+    st.s = Math.max(0.05, Math.min(40, st.s * Math.exp(-e.deltaY / 400))); st.tx = e.clientX - r.left - ix * st.s; st.ty = e.clientY - r.top - iy * st.s; apply(); }, { passive: false });
+
+  // controls
+  const toolBtn = (id, label) => h('button', { class: 'btn' + (st.tool === id ? ' on' : ''), 'data-tool': id, onclick: () => { st.tool = id; root.querySelectorAll('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === id)); } }, label);
+  const undoBtn = h('button', { class: 'btn', onclick: () => { const u = st.undo.pop(); if (u) { mx.putImageData(u, 0, 0); st.dirty = true; } updUndo(); } }, 'Undo');
+  function updUndo() { undoBtn.disabled = !st.undo.length; }
+  const sizeVal = h('span', { class: 'mk-sz' }, st.size);
+  const size = h('input', { type: 'range', min: 6, max: 160, step: 2, value: st.size, oninput: () => { st.size = +size.value; sizeVal.textContent = st.size; const r = stage.getBoundingClientRect(); showRing(r.left + r.width / 2, r.top + r.height / 2); }, onchange: () => { ring.hidden = true; } });
+  const showBtn = h('button', { class: 'btn', onclick: () => { st.shown = !st.shown; mask.style.visibility = st.shown ? '' : 'hidden'; showBtn.textContent = st.shown ? 'Hide' : 'Show'; } }, 'Hide');
+  const invert = () => { snap(); const id = mx.getImageData(0, 0, W, H); const d = id.data; for (let i = 0; i < d.length; i += 4) { const a = 255 - d[i + 3]; d[i] = 255; d[i + 1] = 40; d[i + 2] = 60; d[i + 3] = a; } mx.putImageData(id, 0, 0); st.dirty = true; };
+  const clear = () => { snap(); mx.clearRect(0, 0, W, H); st.dirty = true; };
+  const cancel = () => { if (st.dirty) confirmSheet('Discard mask', 'Throw away the changes to this mask?', 'Discard', closeMasker); else closeMasker(); };
+  const save = async () => {
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    try {
+      // upload canvas: alpha 0 where masked, 255 elsewhere (RGB is ignored by the server)
+      const out = h('canvas', { width: W, height: H }); const ox = out.getContext('2d');
+      const src = mx.getImageData(0, 0, W, H).data; const od = ox.createImageData(W, H); const d = od.data;
+      for (let i = 0; i < d.length; i += 4) d[i + 3] = 255 - src[i + 3];
+      ox.putImageData(od, 0, 0);
+      const blob = await new Promise(res => out.toBlob(res, 'image/png'));
+      const r = await uploadForm('/upload/mask', blob, 'clipspace-mask-' + Date.now() + '.png', {
+        type: 'input', subfolder: 'clipspace',
+        original_ref: JSON.stringify({ filename: ref.filename, subfolder: ref.subfolder || '', type: ref.type || 'input' }) });
+      const val = (r.subfolder ? r.subfolder + '/' : '') + r.name + ' [' + (r.type || 'input') + ']';
+      closeMasker(); onDone(val); toast('Mask saved');
+    } catch (e) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; toast('Saving the mask failed: ' + e.message, true); }
+  };
+  const saveBtn = h('button', { class: 'btn primary', onclick: save }, 'Save');
+  M.cancel = cancel;
+  root.textContent = '';
+  root.append(
+    h('div', { class: 'mk-top' }, h('button', { class: 'btn icon', 'aria-label': 'Cancel', onclick: cancel }, icon('x')), h('div', { class: 't' }, 'Mask · ' + ref.filename), h('button', { class: 'btn', onclick: fit }, 'Fit'), saveBtn),
+    stage,
+    h('div', { class: 'mk-bot' },
+      h('div', { class: 'mk-row' }, toolBtn('brush', 'Paint'), toolBtn('erase', 'Erase'), undoBtn, showBtn),
+      h('div', { class: 'mk-row' }, h('span', { class: 'dim small' }, 'Size'), size, sizeVal, h('button', { class: 'btn', onclick: invert }, 'Invert'), h('button', { class: 'btn danger', onclick: clear }, 'Clear')),
+      h('div', { class: 'dim small mk-hint' }, 'One finger paints. Two fingers move and zoom. Red areas become the mask.')));
+  updUndo(); requestAnimationFrame(fit);
+  M.refit = fit;
+}
+
 // ---------- system integration ----------
 window.__cfBack = () => {
+  if (sheetStack.length && M.open) { closeSheet(); return true; }
+  if (M.open) { if (M.cancel) M.cancel(); else closeMasker(); return true; }
   if (V.open) { closeViewer(); return true; }
   if (sheetStack.length) { closeSheet(); return true; }
   if (R.tab !== 'edit') { switchTab('edit'); return true; }
@@ -843,7 +981,7 @@ window.addEventListener('resize', () => {
   if (window.innerWidth !== lastW) { lastW = window.innerWidth; fullH = window.innerHeight; } // folded, unfolded or rotated
   if (window.innerHeight > fullH) fullH = window.innerHeight;
   document.body.classList.toggle('kb', window.innerWidth < 700 && window.innerHeight < fullH * 0.72);
-  renderPreview();
+  renderPreview(); if (M.open && M.refit) M.refit();
 });
 
 // ---------- start ----------

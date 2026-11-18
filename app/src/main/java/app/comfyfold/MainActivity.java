@@ -260,9 +260,9 @@ public class MainActivity extends Activity {
             return r == null ? "" : r;
         }
 
-        /** multipart/form-data upload to ComfyUI's /upload/image. */
+        /** multipart/form-data POST: text fields from fieldsJson plus one file part named "image". */
         @JavascriptInterface
-        public void upload(String id, String url, String base64, String filename, String mime) {
+        public void uploadForm(String id, String url, String base64, String filename, String mime, String fieldsJson) {
             io.execute(() -> {
                 int status = 0;
                 String text;
@@ -271,11 +271,19 @@ public class MainActivity extends Activity {
                     byte[] data = Base64.decode(base64, Base64.DEFAULT);
                     String boundary = "----ComfyFold" + System.nanoTime();
                     String name = safeName(filename).replace("\"", "_");
-                    byte[] head = ("--" + boundary + "\r\n"
-                            + "Content-Disposition: form-data; name=\"type\"\r\n\r\ninput\r\n"
-                            + "--" + boundary + "\r\n"
-                            + "Content-Disposition: form-data; name=\"image\"; filename=\"" + name + "\"\r\n"
-                            + "Content-Type: " + mime + "\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+                    StringBuilder sb = new StringBuilder();
+                    org.json.JSONObject fields = new org.json.JSONObject(fieldsJson == null || fieldsJson.isEmpty() ? "{}" : fieldsJson);
+                    java.util.Iterator<String> keys = fields.keys();
+                    while (keys.hasNext()) {
+                        String k = keys.next();
+                        sb.append("--").append(boundary).append("\r\n")
+                          .append("Content-Disposition: form-data; name=\"").append(k.replace("\"", "_")).append("\"\r\n\r\n")
+                          .append(fields.optString(k)).append("\r\n");
+                    }
+                    sb.append("--").append(boundary).append("\r\n")
+                      .append("Content-Disposition: form-data; name=\"image\"; filename=\"").append(name).append("\"\r\n")
+                      .append("Content-Type: ").append(mime).append("\r\n\r\n");
+                    byte[] head = sb.toString().getBytes(StandardCharsets.UTF_8);
                     byte[] tail = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
                     c = open(url, "POST");
                     c.setDoOutput(true);
@@ -288,6 +296,42 @@ public class MainActivity extends Activity {
                     }
                     status = c.getResponseCode();
                     text = readResponse(c);
+                } catch (Exception e) {
+                    status = 0;
+                    text = describe(e);
+                } finally {
+                    if (c != null) c.disconnect();
+                }
+                deliver(id, status, text);
+            });
+        }
+
+        /** Older entry point kept for compatibility: plain image upload to the input folder. */
+        @JavascriptInterface
+        public void upload(String id, String url, String base64, String filename, String mime) {
+            uploadForm(id, url, base64, filename, mime, "{\"type\":\"input\"}");
+        }
+
+        /** GET a binary resource and hand it back as a data: URL (so the page can read its pixels). */
+        @JavascriptInterface
+        public void fetchDataUrl(String id, String url) {
+            io.execute(() -> {
+                int status = 0;
+                String text;
+                HttpURLConnection c = null;
+                try {
+                    c = open(url, "GET");
+                    status = c.getResponseCode();
+                    if (status != 200) {
+                        text = readResponse(c);
+                    } else {
+                        byte[] data = readAll(c.getInputStream());
+                        String type = c.getContentType();
+                        if (type == null || type.isEmpty()) type = "application/octet-stream";
+                        int semi = type.indexOf(';');
+                        if (semi >= 0) type = type.substring(0, semi).trim();
+                        text = "data:" + type + ";base64," + Base64.encodeToString(data, Base64.NO_WRAP);
+                    }
                 } catch (Exception e) {
                     status = 0;
                     text = describe(e);
