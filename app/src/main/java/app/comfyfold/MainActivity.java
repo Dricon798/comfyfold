@@ -200,7 +200,7 @@ public class MainActivity extends Activity {
         return checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
     }
 
-    private void watchJobs(String base, String idsJson) {
+    private void startJobWatch(String base, String idsJson) {
         if (!notifyEnabled()) return;
         if (notifyPermitted()) {
             JobWatchService.watch(this, base, idsJson);
@@ -580,7 +580,7 @@ public class MainActivity extends Activity {
         public void watchJobs(String base, String idsJson) {
             runOnUiThread(() -> {
                 try {
-                    watchJobs(base, idsJson);
+                    MainActivity.this.startJobWatch(base, idsJson);
                 } catch (RuntimeException e) {
                     Log.e(TAG, "could not start the job watcher", e);
                 }
