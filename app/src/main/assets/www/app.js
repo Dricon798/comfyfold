@@ -41,6 +41,7 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const clone = o => JSON.parse(JSON.stringify(o));
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 function toast(msg, bad) {
+  document.querySelectorAll('#toasts .toast:not(.bad)').forEach(x => x.remove());
   const t = h('div', { class: 'toast' + (bad ? ' bad' : '') }, msg);
   $('#toasts').append(t);
   setTimeout(() => t.remove(), bad ? 5000 : 2600);
@@ -315,67 +316,153 @@ function valueFits(w, v) {
   if (w.t === 'STRING') return typeof v === 'string';
   return (typeof v === 'string' || typeof v === 'number') && (!CONTROL.has(v) || w.options.includes(v));
 }
-function graphToPrompt(g) {
-  if (!R.oi) throw new Error('Connect to the server first.');
-  const nodes = Array.isArray(g.nodes) ? g.nodes : [];
-  const subIds = new Set(((g.definitions && g.definitions.subgraphs) || []).map(x => x.id));
-  if (nodes.some(n => subIds.has(n.type))) throw new Error('This workflow uses subgraphs, which this app cannot unpack yet.');
-  if (nodes.some(n => /^workflow[\/>]/.test(String(n.type)))) throw new Error('This workflow uses group nodes, which this app cannot unpack.');
-  const byId = new Map(nodes.map(n => [String(n.id), n]));
-  const links = new Map();
-  for (const l of (g.links || [])) { if (!l) continue; if (Array.isArray(l)) links.set(l[0], { from: String(l[1]), slot: l[2] }); else links.set(l.id, { from: String(l.origin_id), slot: l.origin_slot }); }
-  const setNodes = {}; for (const n of nodes) if (n.type === 'SetNode' && Array.isArray(n.widgets_values)) setNodes[n.widgets_values[0]] = n;
-  const missing = new Set();
-  const firstIn = n => n.inputs && n.inputs[0] ? n.inputs[0].link : null;
-  const resolve = (linkId, depth) => {
-    if (linkId == null || depth > 60) return null;
-    const l = links.get(linkId); const n = l && byId.get(l.from);
-    if (!n || n.mode === 2) return null;
-    if (n.type === 'Reroute' || n.type === 'SetNode') return resolve(firstIn(n), depth + 1);
-    if (n.type === 'GetNode') { const sn = setNodes[(n.widgets_values || [])[0]]; return sn ? resolve(firstIn(sn), depth + 1) : null; }
-    if (n.type === 'PrimitiveNode') { const v = (n.widgets_values || [])[0]; return v === undefined ? null : { value: v }; }
-    if (n.mode === 4) { // bypassed: pass the matching input straight through
-      const t = ((n.outputs || [])[l.slot] || {}).type; const ins = n.inputs || [];
-      const inp = (ins[l.slot] && ins[l.slot].type === t) ? ins[l.slot] : ins.find(i => i.type === t);
-      return inp ? resolve(inp.link, depth + 1) : null;
-    }
-    if (!R.oi[n.type]) { missing.add(n.type); return null; }
-    return { link: [String(n.id), l.slot] };
-  };
-  const out = {}, seedModes = {};
-  for (const n of nodes) {
-    if (n.mode === 2 || n.mode === 4 || VIRTUAL.has(n.type)) continue;
-    const ci = R.oi[n.type]; if (!ci) continue; // unknown: only an error if something real depends on it
-    const id = String(n.id); const inputs = {};
-    const spec = Object.assign({}, ci.input && ci.input.required, ci.input && ci.input.optional);
-    const wv = n.widgets_values;
-    if (wv && typeof wv === 'object' && !Array.isArray(wv)) { for (const name in spec) if (widgetSpec(spec[name]) && name in wv) inputs[name] = wv[name]; }
-    else {
-      const vals = Array.isArray(wv) ? wv : []; let i = 0;
-      for (const name in spec) {
-        const w = widgetSpec(spec[name]); if (!w) continue;
-        let j = i; while (j < vals.length && j < i + 3 && !valueFits(w, vals[j])) j++;
-        if (j < vals.length && valueFits(w, vals[j])) { inputs[name] = vals[j]; i = j + 1; }
-        else if (w.def !== undefined) inputs[name] = w.def;
-        if (w.t !== 'STRING' && w.t !== 'BOOLEAN' && typeof vals[i] === 'string' && CONTROL.has(vals[i]) && !(w.t === 'COMBO' && !w.o.control_after_generate)) {
-          if (w.t === 'INT') seedModes[id + '.' + name] = vals[i] === 'fixed' ? 'fixed' : 'random';
-          i++;
-        }
+// Mirrors the ComfyUI frontend's graphToPrompt: subgraph instances are flattened into their inner
+// nodes with execution ids "outer:inner" (nested: "a:b:c"); links that cross a subgraph boundary are
+// followed to the real source; values set on an instance override the inner node's own value.
+const SUB_IN = -10, SUB_OUT = -20;
+function readLinks(arr) {
+  const m = new Map();
+  for (const l of (arr || [])) { if (!l) continue;
+    if (Array.isArray(l)) m.set(l[0], { from: l[1], slot: l[2], to: l[3], tslot: l[4] });
+    else m.set(l.id, { from: l.origin_id, slot: l.origin_slot, to: l.target_id, tslot: l.target_slot }); }
+  return m;
+}
+function nodeWidgetValues(n, ci, id, seedModes) {
+  const inputs = {};
+  const spec = Object.assign({}, ci.input && ci.input.required, ci.input && ci.input.optional);
+  const wv = n.widgets_values;
+  if (wv && typeof wv === 'object' && !Array.isArray(wv)) { for (const name in spec) if (widgetSpec(spec[name]) && name in wv) inputs[name] = wv[name]; }
+  else {
+    const vals = Array.isArray(wv) ? wv : []; let i = 0;
+    for (const name in spec) {
+      const w = widgetSpec(spec[name]); if (!w) continue;
+      let j = i; while (j < vals.length && j < i + 3 && !valueFits(w, vals[j])) j++;
+      if (j < vals.length && valueFits(w, vals[j])) { inputs[name] = vals[j]; i = j + 1; }
+      else if (w.def !== undefined) inputs[name] = w.def;
+      if (w.t !== 'STRING' && w.t !== 'BOOLEAN' && typeof vals[i] === 'string' && CONTROL.has(vals[i]) && !(w.t === 'COMBO' && !w.o.control_after_generate)) {
+        if (w.t === 'INT') seedModes[id + '.' + name] = vals[i] === 'fixed' ? 'fixed' : 'random';
+        i++;
       }
     }
-    for (const inp of (n.inputs || [])) {
-      if (inp.link == null) continue;
-      const name = (inp.widget && inp.widget.name) || inp.name; const r = resolve(inp.link, 0);
-      if (!r) { if (!inp.widget) delete inputs[name]; }
-      else if (r.link) inputs[name] = r.link; else inputs[name] = r.value;
-    }
-    out[id] = { inputs, class_type: n.type, _meta: { title: n.title || ci.display_name || n.type } };
   }
+  return inputs;
+}
+function graphToPrompt(g) {
+  if (!R.oi) throw new Error('Connect to the server first.');
+  const defs = new Map(((g.definitions && g.definitions.subgraphs) || []).map(d => [d.id, d]));
+  const top = Array.isArray(g.nodes) ? g.nodes : [];
+  if (top.some(n => /^workflow[\/>]/.test(String(n.type)))) throw new Error('This workflow uses group nodes, which this app cannot unpack.');
+  const missing = new Set(), out = {}, seedModes = {}, promoted = [];
+  const execId = (ctx, id) => [...ctx.path, id].join(':');
+
+  // ---- build a context per graph level
+  function makeCtx(nodes, links, path, def, inst, parent, depth) {
+    if (depth > 12) throw new Error('Subgraphs are nested too deeply.');
+    const ctx = { nodes: new Map(nodes.map(n => [String(n.id), n])), links: readLinks(links), path, def, inst, parent, children: {}, host: {}, overrides: {} };
+    ctx.setNodes = {}; for (const n of nodes) if (n.type === 'SetNode' && Array.isArray(n.widgets_values)) ctx.setNodes[n.widgets_values[0]] = n;
+    if (def) hostValues(ctx);
+    for (const n of nodes) {
+      const d = defs.get(n.type);
+      if (d && n.mode !== 2 && n.mode !== 4) ctx.children[String(n.id)] = makeCtx(d.nodes || [], d.links || [], [...path, String(n.id)], d, n, ctx, depth + 1);
+    }
+    return ctx;
+  }
+  // values typed into the instance for subgraph inputs that feed widgets
+  function hostValues(ctx) {
+    const { def, inst } = ctx;
+    const widgetBacked = (def.inputs || []).map(si => (si.linkIds || []).some(lid => {
+      const l = ctx.links.get(lid); if (!l) return false;
+      const t = ctx.nodes.get(String(l.to)); const ti = t && (t.inputs || [])[l.tslot];
+      return !!(ti && ti.widget);
+    }));
+    const wv = inst.widgets_values; const props = inst.properties || {};
+    const proxies = Array.isArray(props.proxyWidgets) ? props.proxyWidgets : null;
+    const byName = {};
+    if (wv && typeof wv === 'object' && !Array.isArray(wv)) Object.assign(byName, wv);
+    else if (Array.isArray(wv) && wv.length) {
+      const nWidget = widgetBacked.filter(Boolean).length;
+      if (proxies && wv.length === proxies.length && wv.length !== nWidget) {
+        // older format: one value per promoted widget, in promotion order
+        proxies.forEach(([nid, wname], i) => { if (wname === 'control_after_generate' || wv[i] === undefined) return;
+          if (String(nid) === '-1') byName[wname] = wv[i]; else (ctx.overrides[String(nid)] = ctx.overrides[String(nid)] || {})[wname] = wv[i]; });
+      } else {
+        let k = 0; (def.inputs || []).forEach((si, idx) => { if (widgetBacked[idx]) { if (wv[k] !== undefined) byName[si.name] = wv[k]; k++; } });
+      }
+    }
+    for (const q of (Array.isArray(props.proxyWidgetErrorQuarantine) ? props.proxyWidgetErrorQuarantine : []))
+      if (q && q.originalEntry && String(q.originalEntry[0]) === '-1' && q.hostValue !== undefined) byName[q.originalEntry[1]] = q.hostValue;
+    (def.inputs || []).forEach((si, idx) => { ctx.host[idx] = byName[si.name]; });
+    // remember what the workflow author put on the subgraph's face, to pin it in the app
+    (def.inputs || []).forEach((si, idx) => { if (!widgetBacked[idx]) return;
+      for (const lid of (si.linkIds || [])) { const l = ctx.links.get(lid); const t = l && ctx.nodes.get(String(l.to)); const ti = t && (t.inputs || [])[l.tslot];
+        if (ti && ti.widget && !defs.has(t.type)) promoted.push(execId(ctx, String(t.id)) + '.' + ti.widget.name); } });
+    if (proxies) for (const [nid, wname] of proxies) if (String(nid) !== '-1' && wname !== 'control_after_generate') promoted.push(execId(ctx, String(nid)) + '.' + wname);
+  }
+
+  // ---- link resolution (returns {link:[execId, slot]} | {value} | null)
+  const firstIn = n => n.inputs && n.inputs[0] ? n.inputs[0].link : null;
+  function resolveLink(ctx, linkId, depth) {
+    if (linkId == null || depth > 200) return null;
+    const l = ctx.links.get(linkId); if (!l) return null;
+    if (l.from === SUB_IN || String(l.from) === String(SUB_IN)) return resolveSubInput(ctx, l.slot, depth + 1);
+    const n = ctx.nodes.get(String(l.from)); if (!n) return null;
+    return resolveOut(ctx, n, l.slot, depth + 1);
+  }
+  function resolveSubInput(ctx, k, depth) {
+    if (!ctx.def) return null;
+    const si = (ctx.def.inputs || [])[k]; if (!si) return null;
+    const hi = (ctx.inst.inputs || []).find(i => i.name === si.name);
+    if (hi && hi.link != null) return resolveLink(ctx.parent, hi.link, depth + 1);
+    const v = ctx.host[k]; return v === undefined ? null : { value: v };
+  }
+  function resolveOut(ctx, n, slot, depth) {
+    if (n.mode === 2) return null;
+    if (n.mode === 4) { // bypassed: pass the matching input straight through
+      const t = ((n.outputs || [])[slot] || {}).type; const ins = n.inputs || [];
+      const inp = (ins[slot] && ins[slot].type === t) ? ins[slot] : ins.find(i => i.type === t);
+      return inp ? resolveLink(ctx, inp.link, depth + 1) : null;
+    }
+    if (n.type === 'Reroute' || n.type === 'SetNode') return resolveLink(ctx, firstIn(n), depth + 1);
+    if (n.type === 'GetNode') { const sn = ctx.setNodes[(n.widgets_values || [])[0]]; return sn ? resolveLink(ctx, firstIn(sn), depth + 1) : null; }
+    if (n.type === 'PrimitiveNode') { const v = (n.widgets_values || [])[0]; return v === undefined ? null : { value: v }; }
+    const d = defs.get(n.type);
+    if (d) {
+      const child = ctx.children[String(n.id)]; if (!child) return null;
+      const so = (d.outputs || [])[slot]; if (!so) return null;
+      for (const lid of (so.linkIds || [])) { const l = child.links.get(lid); if (l && String(l.to) === String(SUB_OUT)) return resolveLink(child, lid, depth + 1); }
+      for (const [lid, l] of child.links) if (String(l.to) === String(SUB_OUT) && l.tslot === slot) return resolveLink(child, lid, depth + 1);
+      return null;
+    }
+    if (!R.oi[n.type]) { missing.add(n.type); return null; }
+    return { link: [execId(ctx, String(n.id)), slot] };
+  }
+
+  // ---- emit real nodes
+  function emit(ctx) {
+    for (const [id, n] of ctx.nodes) {
+      if (n.mode === 2 || n.mode === 4 || VIRTUAL.has(n.type)) continue;
+      if (defs.has(n.type)) { if (ctx.children[id]) emit(ctx.children[id]); continue; }
+      const ci = R.oi[n.type]; if (!ci) continue; // unknown: only an error if something real depends on it
+      const eid = execId(ctx, id);
+      const inputs = nodeWidgetValues(n, ci, eid, seedModes);
+      const ov = ctx.overrides[id]; if (ov) for (const k in ov) if (k in inputs) inputs[k] = ov[k];
+      for (const inp of (n.inputs || [])) {
+        if (inp.link == null) continue;
+        const name = (inp.widget && inp.widget.name) || inp.name; const r = resolveLink(ctx, inp.link, 0);
+        if (!r) { if (!inp.widget) delete inputs[name]; }
+        else if (r.link) inputs[name] = r.link; else inputs[name] = Array.isArray(r.value) ? { __value__: r.value } : r.value;
+      }
+      const title = n.title || ci.display_name || n.type;
+      out[eid] = { inputs, class_type: n.type, _meta: { title: ctx.path.length && ctx.inst ? title + ' · ' + (ctx.inst.title || ctx.def.name || 'Subgraph') : title } };
+    }
+  }
+  emit(makeCtx(top, g.links || [], [], null, null, null, 0));
   if (missing.size) throw new Error('It needs node types that are not installed on this server: ' + [...missing].join(', '));
   for (const id in out) for (const k in out[id].inputs) { const v = out[id].inputs[k]; if (isLink(v) && !out[v[0]]) delete out[id].inputs[k]; }
   if (!Object.keys(out).length) throw new Error('No runnable nodes were found in this workflow.');
-  return { prompt: out, seedModes };
+  return { prompt: out, seedModes, promoted: [...new Set(promoted)].filter(k => { const [i, nm] = splitKey(k); return out[i] && nm in out[i].inputs && !isLink(out[i].inputs[nm]); }) };
 }
+const mergePins = (promoted, prompt) => [...new Set([...(promoted || []), ...defaultPins(prompt)])];
 async function refreshRemote() {
   const r = await api('GET', '/api/userdata?dir=workflows&recurse=true&split=false&full_info=true');
   if (r.status !== 200 || !Array.isArray(r.data)) { R.remote = []; return; }
@@ -395,8 +482,8 @@ async function pullRemote(it, existing) {
     const r = await api('GET', '/api/userdata/' + encodeURIComponent('workflows/' + it.path));
     if (r.status !== 200 || !r.data || typeof r.data !== 'object') throw new Error('The server could not send the file (HTTP ' + r.status + ').');
     const c = Array.isArray(r.data.nodes) ? graphToPrompt(r.data) : { prompt: normalizePrompt(r.data), seedModes: {} };
-    if (existing) { existing.prompt = c.prompt; existing.seedModes = c.seedModes; existing.pins = defaultPins(c.prompt); S.activeWorkflow = existing.id; saveNow(); R.fieldErrs = {}; switchTab('edit'); toast('Reloaded from the rig'); }
-    else addWorkflow(it.name, c.prompt, { seedModes: c.seedModes, src: { server: S.activeServer, path: it.path } });
+    if (existing) { existing.prompt = c.prompt; existing.seedModes = c.seedModes; existing.pins = mergePins(c.promoted, c.prompt); S.activeWorkflow = existing.id; saveNow(); R.fieldErrs = {}; switchTab('edit'); toast('Reloaded from the rig'); }
+    else addWorkflow(it.name, c.prompt, { seedModes: c.seedModes, pins: mergePins(c.promoted, c.prompt), src: { server: S.activeServer, path: it.path } });
   } catch (e) {
     openSheet('Could not open "' + it.name + '"', [h('div', { class: 'note bad' }, e.message), h('div', { class: 'dim small' }, 'You can still use it: run it once in ComfyUI on the PC, then add it here from Add workflow > From recent runs.')]);
   }
