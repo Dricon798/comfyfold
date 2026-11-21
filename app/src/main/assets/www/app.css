@@ -180,6 +180,14 @@ details.node .field { background: var(--panel2); }
 #viewer .v-bot { display: flex; gap: 8px; padding: 8px; background: rgba(18,19,22,.9); overflow-x: auto; }
 #viewer .v-bot .btn { flex: 1; white-space: nowrap; padding: 0 12px; font-size: 14px; }
 #viewer .btn { background: #26282e; }
+#logview { position: fixed; inset: 0; background: var(--bg); z-index: 33; display: flex; flex-direction: column; }
+#logview .v-top, #logview .v-bot { display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: var(--panel); }
+#logview .v-top { border-bottom: 1px solid var(--line); }
+#logview .v-top .t { flex: 1; min-width: 0; font-weight: 600; }
+#logview .v-bot { border-top: 1px solid var(--line); }
+#logview .v-bot .btn { flex: 1; }
+.log-body { flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; }
+.log-pre { margin: 0; padding: 10px 12px; font: 12px/1.45 ui-monospace, "Roboto Mono", monospace; white-space: pre-wrap; word-break: break-word; color: #d5d8de; user-select: text; }
 
 /* mask editor */
 #masker { position: fixed; inset: 0; background: #0b0c0e; z-index: 35; display: flex; flex-direction: column; }

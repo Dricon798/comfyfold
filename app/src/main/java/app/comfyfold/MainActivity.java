@@ -546,6 +546,44 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void copyText(String text) {
+            runOnUiThread(() -> {
+                android.content.ClipboardManager cm = getSystemService(android.content.ClipboardManager.class);
+                if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("ComfyFold", text));
+            });
+        }
+
+        /** Share text as a .txt attachment, so long logs survive apps that cut off plain messages. */
+        @JavascriptInterface
+        public void shareText(String text, String filename) {
+            io.execute(() -> {
+                try {
+                    File dir = new File(getCacheDir(), "share");
+                    if (!dir.exists() && !dir.mkdirs()) throw new Exception("cache unavailable");
+                    File[] old = dir.listFiles();
+                    if (old != null) for (File f : old) f.delete();
+                    File file = new File(dir, safeName(filename));
+                    try (OutputStream out = new FileOutputStream(file)) {
+                        out.write((text == null ? "" : text).getBytes(StandardCharsets.UTF_8));
+                    }
+                    Uri uri = FileProvider.getUriForFile(MainActivity.this, getPackageName() + ".files", file);
+                    Intent send = new Intent(Intent.ACTION_SEND);
+                    send.setType("text/plain");
+                    send.putExtra(Intent.EXTRA_STREAM, uri);
+                    send.putExtra(Intent.EXTRA_SUBJECT, file.getName());
+                    send.setClipData(ClipData.newRawUri(file.getName(), uri));
+                    send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    runOnUiThread(() -> {
+                        expectingReturn = true;
+                        startActivity(Intent.createChooser(send, "Share"));
+                    });
+                } catch (Exception e) {
+                    toast("Share failed: " + describe(e), true);
+                }
+            });
+        }
+
+        @JavascriptInterface
         public void keepAwake(boolean on) {
             runOnUiThread(() -> {
                 if (on) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

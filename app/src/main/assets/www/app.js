@@ -955,6 +955,9 @@ function renderSettings() {
       h('span', null, 'RAM free'), h('span', null, gb(sys.ram_free) + ' of ' + gb(sys.ram_total)),
       h('span', null, 'Node types'), h('span', null, R.oi ? Object.keys(R.oi).length : '?')),
       h('div', { class: 'row', style: 'margin-top:12px' },
+        h('button', { class: 'btn grow', onclick: () => openLog() }, 'Server log'),
+        h('button', { class: 'btn grow', onclick: shareDiagnostics }, 'Share diagnostics')),
+      h('div', { class: 'row', style: 'margin-top:12px' },
         h('button', { class: 'btn grow', onclick: () => connect() }, icon('refresh'), 'Reload'),
         h('button', { class: 'btn grow', onclick: async () => { try { await api('POST', '/free', { unload_models: true, free_memory: true }); toast('Asked the server to unload models'); setTimeout(async () => { try { R.stats = (await api('GET', '/system_stats')).data; if (R.tab === 'settings') renderSettings(); } catch (e) {} }, 2500); } catch (e) { toast(e.message, true); } } }, 'Unload models')));
   } else if (s) info = h('div', { class: 'note' + (R.connecting ? '' : ' bad') }, R.connecting ? 'Connecting to ' + s.url + '…' : 'Could not connect to ' + s.url + (R.connErr ? ' (' + R.connErr + ')' : '') + '.', R.connecting ? null : h('div', { style: 'margin-top:10px' }, h('button', { class: 'btn', onclick: () => connect() }, 'Try again')));
@@ -1119,10 +1122,65 @@ function buildMasker(root, ref, rgb, alpha, onDone) {
   M.refit = fit;
 }
 
+// ---------- server log + diagnostics ----------
+const LOGV = { open: false, timer: null };
+async function fetchLog() {
+  const r = await api('GET', '/internal/logs');
+  if (r.status !== 200) throw new Error(r.status === 404 ? 'this ComfyUI version does not share its log' : 'HTTP ' + r.status);
+  return typeof r.data === 'string' ? r.data : JSON.stringify(r.data, null, 1);
+}
+function copyText(text) {
+  if (bridge && bridge.copyText) { bridge.copyText(text); toast('Copied'); return; }
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject(new Error('no clipboard'))).then(() => toast('Copied'), e => toast('Copy failed: ' + e.message, true));
+}
+function shareText(text, name) {
+  if (bridge && bridge.shareText) { bridge.shareText(text, name); return; }
+  const a = h('a', { href: URL.createObjectURL(new Blob([text], { type: 'text/plain' })), download: name }); a.click();
+}
+function openLog() {
+  if (!R.connected) { toast('Not connected', true); return; }
+  const root = $('#logview'); root.textContent = ''; root.hidden = false; LOGV.open = true;
+  const pre = h('pre', { class: 'log-pre' }, 'Loading…');
+  const body = h('div', { class: 'log-body' }, pre);
+  let text = '';
+  const load = async (quiet) => {
+    const atEnd = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
+    try { text = await fetchLog(); pre.textContent = text || '(the log is empty)'; if (atEnd || !quiet) body.scrollTop = body.scrollHeight; }
+    catch (e) { pre.textContent = 'Could not load the log: ' + e.message; stopLive(); }
+  };
+  const live = h('input', { type: 'checkbox', onchange: () => { if (live.checked) LOGV.timer = setInterval(() => load(true), 2000); else stopLive(); } });
+  const stopLive = () => { clearInterval(LOGV.timer); LOGV.timer = null; live.checked = false; };
+  root.append(
+    h('div', { class: 'v-top' }, h('button', { class: 'btn icon', 'aria-label': 'Close', onclick: closeLog }, icon('x')), h('div', { class: 't' }, 'Server log'),
+      h('label', { class: 'row small', style: 'gap:8px;margin-right:6px' }, h('span', { class: 'switch', style: 'width:52px;height:32px' }, live, h('i')), 'Live'),
+      h('button', { class: 'btn icon', 'aria-label': 'Refresh', onclick: () => load(false) }, icon('refresh'))),
+    body,
+    h('div', { class: 'v-bot' },
+      h('button', { class: 'btn', onclick: () => copyText(text) }, 'Copy'),
+      h('button', { class: 'btn', onclick: () => shareText(text, 'comfyui-log.txt') }, 'Share'),
+      h('button', { class: 'btn', onclick: () => { body.scrollTop = body.scrollHeight; } }, 'Jump to end')));
+  load(false);
+}
+function closeLog() { clearInterval(LOGV.timer); LOGV.timer = null; LOGV.open = false; const r = $('#logview'); r.hidden = true; r.textContent = ''; }
+async function shareDiagnostics() {
+  if (!R.connected) { toast('Not connected', true); return; }
+  toast('Collecting…');
+  const part = async (label, fn) => { try { return '===== ' + label + ' =====\n' + await fn() + '\n\n'; } catch (e) { return '===== ' + label + ' =====\n(unavailable: ' + e.message + ')\n\n'; } };
+  const get = async path => { const r = await api('GET', path); if (r.status !== 200) throw new Error('HTTP ' + r.status); return JSON.stringify(r.data, null, 1); };
+  const wf = curWf();
+  let out = 'ComfyFold diagnostics\nTime: ' + new Date().toString() + '\nServer: ' + base() + '\nOpen workflow: ' + (wf ? wf.name + (wf.src ? ' (from ' + wf.src.path + ')' : '') : 'none') + '\n\n';
+  out += await part('Queue (running and waiting jobs, exactly as sent)', () => get('/queue'));
+  out += await part('Live progress seen by the app', async () => JSON.stringify(R.prog));
+  out += await part('Server stats', () => get('/system_stats'));
+  out += await part('Server log', async () => { const t = await fetchLog(); return t.length > 300000 ? '(earlier lines cut)\n' + t.slice(-300000) : t; });
+  shareText(out, 'comfyfold-diagnostics-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.txt');
+}
+
 // ---------- system integration ----------
 window.__cfBack = () => {
   if (sheetStack.length && M.open) { closeSheet(); return true; }
   if (M.open) { if (M.cancel) M.cancel(); else closeMasker(); return true; }
+  if (LOGV.open) { closeLog(); return true; }
   if (V.open) { closeViewer(); return true; }
   if (sheetStack.length) { closeSheet(); return true; }
   if (R.tab !== 'edit') { switchTab('edit'); return true; }
