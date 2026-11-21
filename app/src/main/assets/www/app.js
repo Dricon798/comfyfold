@@ -812,7 +812,7 @@ async function generate() {
   if (!R.connected) { toast('Not connected to a server', true); return; }
   if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
   R.fieldErrs = {};
-  const n = Math.max(1, S.runCount || 1); let sent = 0;
+  const n = Math.max(1, S.runCount || 1); let sent = 0; const ids = [];
   for (let i = 0; i < n; i++) {
     for (const id in wf.prompt) { const node = wf.prompt[id];
       for (const name of editableInputs(node)) { const key = id + '.' + name; const info = fieldInfo(node, name);
@@ -821,10 +821,13 @@ async function generate() {
     try { r = await api('POST', '/prompt', { prompt: wf.prompt, client_id: S.clientId }); }
     catch (e) { toast('Could not reach the server: ' + e.message, true); break; }
     if (r.status !== 200 || !r.data || !r.data.prompt_id) { showPromptError(wf, r); break; }
-    R.mine.add(r.data.prompt_id); sent++;
+    R.mine.add(r.data.prompt_id); ids.push(r.data.prompt_id); sent++;
   }
   saveNow();
-  if (sent) { toast(sent === 1 ? 'Queued' : 'Queued ' + sent + ' runs'); refreshQueue().catch(() => {}); }
+  if (sent) {
+    toast(sent === 1 ? 'Queued' : 'Queued ' + sent + ' runs'); refreshQueue().catch(() => {});
+    if (bridge && bridge.watchJobs) { try { bridge.watchJobs(base(), JSON.stringify(ids)); } catch (e) { /* notifications are optional */ } }
+  }
 }
 function showPromptError(wf, r) {
   const d = r.data && typeof r.data === 'object' ? r.data : {};
@@ -986,7 +989,11 @@ function privacySection() {
   const grace = h('select', { style: 'width:auto;min-width:150px', onchange: () => { L.grace = +grace.value; push(); } },
     [[0, 'Immediately'], [60, 'After 1 minute'], [300, 'After 5 minutes'], [900, 'After 15 minutes']].map(([v, t]) => h('option', { value: v }, t)));
   grace.value = String(L.grace | 0);
+  let N = null; try { if (bridge.notifyInfo) N = JSON.parse(bridge.notifyInfo()); } catch (e) { N = null; }
   return [
+    N ? h('h2', null, 'Notifications') : null,
+    N ? h('div', { class: 'card' },
+      row('Notify when a job finishes', N.enabled && !N.permitted ? 'Notifications are blocked for this app. Tap to allow.' : 'Only while the app is in the background', sw(N.enabled && N.permitted, v => { bridge.setNotify(v); setTimeout(renderSettings, 300); }))) : null,
     h('h2', null, 'Privacy'),
     h('div', { class: 'card' },
       L.problem ? h('div', { class: 'note bad' }, L.problem) : null,
@@ -1184,6 +1191,8 @@ async function shareDiagnostics() {
   out += await part('Server log', async () => { const t = await fetchLog(); return t.length > 300000 ? '(earlier lines cut)\n' + t.slice(-300000) : t; });
   shareText(out, 'comfyfold-diagnostics-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.txt');
 }
+
+window.__cfNotifyChanged = () => { if (R.tab === 'settings') renderSettings(); };
 
 // ---------- system integration ----------
 window.__cfBack = () => {

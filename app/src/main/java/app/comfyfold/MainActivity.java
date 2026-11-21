@@ -6,7 +6,9 @@ import android.content.ClipData;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.Manifest;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.hardware.biometrics.BiometricManager;
@@ -75,6 +77,8 @@ public class MainActivity extends Activity {
     private boolean autoPrompt = false;      // prompt once by itself after locking; afterwards only via the button
     private boolean expectingReturn = false;   // we launched a picker / share sheet ourselves
     private long backgroundedAt = 0;
+    private static final int REQ_NOTIFY = 42;
+    private String pendingWatchBase, pendingWatchIds;   // jobs waiting for the notification permission answer
     private ValueCallback<Uri[]> fileCallback;
     private final ExecutorService io = Executors.newFixedThreadPool(4);
     private final ConcurrentHashMap<String, String> results = new ConcurrentHashMap<>();
@@ -186,11 +190,46 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---- job notifications ---------------------------------------------------------------
+
+    private boolean notifyEnabled() {
+        return prefs.getBoolean("notify", true);
+    }
+
+    private boolean notifyPermitted() {
+        return checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void watchJobs(String base, String idsJson) {
+        if (!notifyEnabled()) return;
+        if (notifyPermitted()) {
+            JobWatchService.watch(this, base, idsJson);
+        } else if (!prefs.getBoolean("notifyAsked", false)) {
+            pendingWatchBase = base;
+            pendingWatchIds = idsJson;
+            prefs.edit().putBoolean("notifyAsked", true).apply();
+            expectingReturn = true;
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFY);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_NOTIFY) return;
+        boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (ok && pendingWatchBase != null) JobWatchService.watch(this, pendingWatchBase, pendingWatchIds);
+        pendingWatchBase = pendingWatchIds = null;
+        web.evaluateJavascript("window.__cfNotifyChanged && window.__cfNotifyChanged()", null);
+    }
+
     // ---- app lock ------------------------------------------------------------------------
 
     @Override
     protected void onStart() {
         super.onStart();
+        JobWatchService.appVisible = true;
+        JobWatchService.clearDone(this);
         if (backgroundedAt > 0 && !expectingReturn && lockEnabled() && canLock() == null) {
             long away = (SystemClock.elapsedRealtime() - backgroundedAt) / 1000;
             if (away >= prefs.getInt("grace", 0)) setLocked(true);
@@ -208,6 +247,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onStop() {
         super.onStop();
+        JobWatchService.appVisible = false;
         if (prompting || expectingReturn) return;
         backgroundedAt = SystemClock.elapsedRealtime();
         // lock right away so nothing is visible behind the lock screen when the app comes back
@@ -533,6 +573,41 @@ public class MainActivity extends Activity {
                     .putBoolean("hideRecents", hideRecents)
                     .apply();
             runOnUiThread(MainActivity.this::applyRecentsSetting);
+        }
+
+        /** Jobs just queued from this phone; a background watcher posts "Job complete" when each finishes. */
+        @JavascriptInterface
+        public void watchJobs(String base, String idsJson) {
+            runOnUiThread(() -> {
+                try {
+                    watchJobs(base, idsJson);
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "could not start the job watcher", e);
+                }
+            });
+        }
+
+        /** JSON: enabled (the app setting), permitted (Android permission granted). */
+        @JavascriptInterface
+        public String notifyInfo() {
+            return "{\"enabled\":" + notifyEnabled() + ",\"permitted\":" + notifyPermitted() + "}";
+        }
+
+        @JavascriptInterface
+        public void setNotify(boolean enabled) {
+            prefs.edit().putBoolean("notify", enabled).apply();
+            if (enabled && !notifyPermitted()) runOnUiThread(() -> {
+                if (shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS) || !prefs.getBoolean("notifyAsked", false)) {
+                    prefs.edit().putBoolean("notifyAsked", true).apply();
+                    expectingReturn = true;
+                    requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFY);
+                } else {
+                    // Android will not ask again: open the app's notification settings instead
+                    expectingReturn = true;
+                    startActivity(new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName()));
+                }
+            });
         }
 
         @JavascriptInterface
