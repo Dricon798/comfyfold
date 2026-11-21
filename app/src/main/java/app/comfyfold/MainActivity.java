@@ -229,8 +229,14 @@ public class MainActivity extends Activity {
 
     /** null when the phone can show the unlock prompt, otherwise a reason it cannot. */
     private String canLock() {
-        BiometricManager bm = getSystemService(BiometricManager.class);
-        int r = bm == null ? -1 : bm.canAuthenticate(AUTHENTICATORS);
+        int r;
+        try {
+            BiometricManager bm = getSystemService(BiometricManager.class);
+            r = bm == null ? -1 : bm.canAuthenticate(AUTHENTICATORS);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Unlock check failed", e);
+            return "The unlock check failed: " + describe(e);
+        }
         if (r == BiometricManager.BIOMETRIC_SUCCESS) return null;
         if (r == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED) return "Set up a screen lock or fingerprint on the phone first.";
         return "This phone cannot show an unlock prompt right now.";
@@ -253,6 +259,17 @@ public class MainActivity extends Activity {
         if (prompting) return;
         if (canLock() != null) { setLocked(false); return; }
         prompting = true;
+        try {
+            showPrompt();
+        } catch (RuntimeException e) {
+            // never trap the user behind a lock screen we cannot open
+            Log.e(TAG, "Unlock prompt failed", e);
+            prompting = false;
+            setLocked(false);
+        }
+    }
+
+    private void showPrompt() {
         BiometricPrompt prompt = new BiometricPrompt.Builder(this)
                 .setTitle("Unlock ComfyFold")
                 .setSubtitle("Use your fingerprint or screen lock")

@@ -38,7 +38,9 @@ android {
     }
 
     lint {
-        abortOnError false
+        // Fail the build on mistakes that crash at runtime (missing permission, API too new).
+        checkOnly 'MissingPermission', 'NewApi', 'InlinedApi', 'MissingClass', 'WrongConstant'
+        abortOnError true
         checkReleaseBuilds false
     }
 }
