@@ -330,7 +330,7 @@ function defaultPins(prompt) {
 function normalizePrompt(obj) {
   if (obj && obj.prompt && typeof obj.prompt === 'object' && !obj.prompt.class_type) obj = obj.prompt;
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('Not a workflow file.');
-  if (Array.isArray(obj.nodes)) throw new Error('This file is in the editor format. In ComfyUI use File > Export (API), or run the workflow once on the PC and add it from Recent runs.');
+  if (Array.isArray(obj.nodes)) throw new Error('This is a normal ComfyUI workflow; it needs converting.');
   const ids = Object.keys(obj);
   if (!ids.length || !ids.every(k => obj[k] && typeof obj[k] === 'object' && obj[k].class_type && obj[k].inputs)) throw new Error('This does not look like an API-format workflow.');
   return clone(obj);
@@ -606,22 +606,31 @@ function renderWorkflows() {
     h('button', { class: 'btn block', onclick: addWorkflowSheet }, icon('plus'), 'Add from recent runs or a file'));
 }
 function addWorkflowSheet() {
-  const file = h('input', { type: 'file', accept: 'application/json,.json', style: 'display:none', onchange: () => {
+  const file = h('input', { type: 'file', style: 'display:none', onchange: () => {
     const f = file.files[0]; if (!f) return;
     const fr = new FileReader(); fr.onload = () => importJson(String(fr.result), f.name.replace(/\.json$/i, '')); fr.readAsText(f);
   } });
   openSheet('Add workflow', [
     h('button', { class: 'btn block primary', onclick: () => { closeSheet(); recentRunsSheet(); } }, 'From recent runs on the server'),
-    h('button', { class: 'btn block', onclick: () => file.click() }, 'Import API-format JSON file'),
+    h('button', { class: 'btn block', onclick: () => file.click() }, 'Import workflow file (.json)'),
     h('button', { class: 'btn block', onclick: () => { closeSheet(); pasteSheet(); } }, 'Paste JSON'),
     file,
-    h('div', { class: 'dim small' }, 'Recent runs lists everything ComfyUI has executed since it last started, from any device. Workflows you add are stored in this app.'),
+    h('div', { class: 'dim small' }, 'Workflow files can be normal ComfyUI saves or Export (API) files. Recent runs lists everything ComfyUI has executed since it last started. Workflows you add are stored in this app.'),
   ]);
 }
+// Accepts both ComfyUI formats: the normal saved workflow (what you drag into ComfyUI) and Export (API).
 function importJson(text, name) {
-  let prompt; try { prompt = normalizePrompt(JSON.parse(text)); } catch (e) { toast(e.message, true); return; }
+  let obj;
+  try { obj = JSON.parse(String(text).replace(/^\uFEFF/, '')); } catch (e) { toast('That file is not valid JSON.', true); return; }
+  let prompt, extra = {};
+  try {
+    if (obj && Array.isArray(obj.nodes)) {
+      if (!R.connected) throw new Error('Connect to the server first: converting a saved workflow needs the server\'s node list.');
+      const c = graphToPrompt(obj); prompt = c.prompt; extra = { seedModes: c.seedModes, pins: mergePins(c.promoted, c.prompt) };
+    } else prompt = normalizePrompt(obj);
+  } catch (e) { while (sheetStack.length) closeSheet(); openSheet('Could not import', [h('div', { class: 'note bad' }, e.message)]); return; }
   while (sheetStack.length) closeSheet();
-  askText('Name this workflow', 'Name', name || 'Workflow', v => addWorkflow(v, prompt));
+  askText('Name this workflow', 'Name', name || 'Workflow', v => addWorkflow(v, prompt, extra));
 }
 function pasteSheet() {
   const ta = h('textarea', { placeholder: '{ "3": { "class_type": "KSampler", ... } }', spellcheck: 'false' });
