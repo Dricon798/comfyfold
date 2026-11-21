@@ -5,9 +5,20 @@ import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.hardware.biometrics.BiometricManager;
+import android.hardware.biometrics.BiometricPrompt;
+import android.os.CancellationSignal;
+import android.os.SystemClock;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.widget.Button;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.MediaStore;
@@ -53,6 +64,17 @@ public class MainActivity extends Activity {
     private static final int BG = Color.rgb(0x12, 0x13, 0x16);
 
     private WebView web;
+
+    // ---- app lock state ----
+    private static final int AUTHENTICATORS =
+            BiometricManager.Authenticators.BIOMETRIC_WEAK | BiometricManager.Authenticators.DEVICE_CREDENTIAL;
+    private SharedPreferences prefs;
+    private View lockView;
+    private boolean locked = false;
+    private boolean prompting = false;
+    private boolean autoPrompt = false;      // prompt once by itself after locking; afterwards only via the button
+    private boolean expectingReturn = false;   // we launched a picker / share sheet ourselves
+    private long backgroundedAt = 0;
     private ValueCallback<Uri[]> fileCallback;
     private final ExecutorService io = Executors.newFixedThreadPool(4);
     private final ConcurrentHashMap<String, String> results = new ConcurrentHashMap<>();
@@ -69,6 +91,12 @@ public class MainActivity extends Activity {
         web.setOverScrollMode(View.OVER_SCROLL_NEVER);
         root.addView(web, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        prefs = getSharedPreferences("lock", MODE_PRIVATE);
+        lockView = buildLockView();
+        root.addView(lockView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        applyRecentsSetting();
+        setLocked(lockEnabled() && canLock() == null);
         setContentView(root);
 
         // Keep the page clear of the status bar, gesture bar, cutouts and the on-screen keyboard.
@@ -113,6 +141,7 @@ public class MainActivity extends Activity {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
                 fileCallback = callback;
                 try {
+                    expectingReturn = true;
                     startActivityForResult(params.createIntent(), REQ_FILE);
                 } catch (ActivityNotFoundException e) {
                     fileCallback = null;
@@ -131,9 +160,12 @@ public class MainActivity extends Activity {
         // Back: let the page close its viewer / sheet first; otherwise send the app to the background.
         getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                 OnBackInvokedDispatcher.PRIORITY_DEFAULT,
-                () -> web.evaluateJavascript("window.__cfBack ? window.__cfBack() : false", v -> {
+                () -> {
+                    if (locked) { moveTaskToBack(true); return; }
+                    web.evaluateJavascript("window.__cfBack ? window.__cfBack() : false", v -> {
                     if (!"true".equals(v)) moveTaskToBack(true);
-                }));
+                });
+                });
 
         if (savedInstanceState == null) web.loadUrl("file:///android_asset/www/index.html");
         else web.restoreState(savedInstanceState);
@@ -152,6 +184,124 @@ public class MainActivity extends Activity {
             fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
             fileCallback = null;
         }
+    }
+
+    // ---- app lock ------------------------------------------------------------------------
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (backgroundedAt > 0 && !expectingReturn && lockEnabled() && canLock() == null) {
+            long away = (SystemClock.elapsedRealtime() - backgroundedAt) / 1000;
+            if (away >= prefs.getInt("grace", 0)) setLocked(true);
+        }
+        expectingReturn = false;
+        backgroundedAt = 0;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        expectingReturn = false;   // the picker or share sheet is gone either way
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (prompting || expectingReturn) return;
+        backgroundedAt = SystemClock.elapsedRealtime();
+        // lock right away so nothing is visible behind the lock screen when the app comes back
+        if (lockEnabled() && prefs.getInt("grace", 0) == 0 && canLock() == null) setLocked(true);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && locked && !prompting && autoPrompt) {
+            autoPrompt = false;
+            authenticate();
+        }
+    }
+
+    private boolean lockEnabled() {
+        return prefs.getBoolean("enabled", true);
+    }
+
+    /** null when the phone can show the unlock prompt, otherwise a reason it cannot. */
+    private String canLock() {
+        BiometricManager bm = getSystemService(BiometricManager.class);
+        int r = bm == null ? -1 : bm.canAuthenticate(AUTHENTICATORS);
+        if (r == BiometricManager.BIOMETRIC_SUCCESS) return null;
+        if (r == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED) return "Set up a screen lock or fingerprint on the phone first.";
+        return "This phone cannot show an unlock prompt right now.";
+    }
+
+    private void applyRecentsSetting() {
+        // Hides the app's content in the recent-apps switcher (Android 13+), without blocking screenshots.
+        setRecentsScreenshotEnabled(!prefs.getBoolean("hideRecents", true));
+    }
+
+    private void setLocked(boolean on) {
+        locked = on;
+        if (on) autoPrompt = true;
+        lockView.setVisibility(on ? View.VISIBLE : View.GONE);
+        web.setVisibility(on ? View.INVISIBLE : View.VISIBLE);
+        if (on) web.clearFocus();
+    }
+
+    private void authenticate() {
+        if (prompting) return;
+        if (canLock() != null) { setLocked(false); return; }
+        prompting = true;
+        BiometricPrompt prompt = new BiometricPrompt.Builder(this)
+                .setTitle("Unlock ComfyFold")
+                .setSubtitle("Use your fingerprint or screen lock")
+                .setAllowedAuthenticators(AUTHENTICATORS)
+                .setConfirmationRequired(false)
+                .build();
+        prompt.authenticate(new CancellationSignal(), getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
+            @Override
+            public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                prompting = false;
+                setLocked(false);
+            }
+
+            @Override
+            public void onAuthenticationError(int errorCode, CharSequence errString) {
+                prompting = false;   // cancelled or too many tries: stay locked, the Unlock button retries
+            }
+        });
+    }
+
+    private int dp(int v) {
+        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
+    }
+
+    private View buildLockView() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setBackgroundColor(BG);
+        box.setClickable(true);   // swallow touches meant for the page underneath
+        box.setFocusable(true);
+        ImageView lockIcon = new ImageView(this);
+        lockIcon.setImageResource(R.drawable.ic_lock);
+        box.addView(lockIcon, new LinearLayout.LayoutParams(dp(72), dp(72)));
+        TextView title = new TextView(this);
+        title.setText("ComfyFold is locked");
+        title.setTextColor(Color.rgb(0xEC, 0xEE, 0xF2));
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, dp(20), 0, dp(28));
+        box.addView(title);
+        Button unlock = new Button(this);
+        unlock.setText("Unlock");
+        unlock.setAllCaps(false);
+        unlock.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        unlock.setOnClickListener(v -> authenticate());
+        box.addView(unlock, new LinearLayout.LayoutParams(dp(200), dp(56)));
+        box.setVisibility(View.GONE);
+        return box;
     }
 
     @Override
@@ -342,6 +492,42 @@ public class MainActivity extends Activity {
             });
         }
 
+        /** Current lock settings as JSON: enabled, grace (seconds), hideRecents, problem (null when usable). */
+        @JavascriptInterface
+        public String lockInfo() {
+            try {
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("enabled", lockEnabled());
+                o.put("grace", prefs.getInt("grace", 0));
+                o.put("hideRecents", prefs.getBoolean("hideRecents", true));
+                String problem = canLock();
+                o.put("problem", problem == null ? org.json.JSONObject.NULL : problem);
+                return o.toString();
+            } catch (Exception e) {
+                return "{}";
+            }
+        }
+
+        @JavascriptInterface
+        public void setLock(boolean enabled, int graceSeconds, boolean hideRecents) {
+            prefs.edit()
+                    .putBoolean("enabled", enabled)
+                    .putInt("grace", Math.max(0, graceSeconds))
+                    .putBoolean("hideRecents", hideRecents)
+                    .apply();
+            runOnUiThread(MainActivity.this::applyRecentsSetting);
+        }
+
+        @JavascriptInterface
+        public void lockNow() {
+            runOnUiThread(() -> {
+                if (canLock() == null) {
+                    setLocked(true);
+                    authenticate();
+                }
+            });
+        }
+
         @JavascriptInterface
         public void keepAwake(boolean on) {
             runOnUiThread(() -> {
@@ -418,7 +604,10 @@ public class MainActivity extends Activity {
                     send.putExtra(Intent.EXTRA_STREAM, uri);
                     send.setClipData(ClipData.newRawUri(name, uri));
                     send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    runOnUiThread(() -> startActivity(Intent.createChooser(send, "Share")));
+                    runOnUiThread(() -> {
+                        expectingReturn = true;
+                        startActivity(Intent.createChooser(send, "Share"));
+                    });
                 } catch (Exception e) {
                     toast("Share failed: " + describe(e), true);
                 }

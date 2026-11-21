@@ -962,7 +962,27 @@ function renderSettings() {
     h('h1', null, 'Server'), info,
     h('h2', null, 'Your ComfyUI machines'), servers,
     h('button', { class: 'btn block', onclick: () => serverSheet(null) }, icon('plus'), 'Add server'),
+    privacySection(),
     S.servers.length ? null : h('div', { class: 'dim small', style: 'margin-top:14px' }, 'Enter the address you use in the browser, for example 100.101.102.103:8188 or your Tailscale machine name. ComfyUI must be started with --listen so it accepts connections from other devices.'));
+}
+function privacySection() {
+  if (!bridge || !bridge.lockInfo) return null;
+  let L; try { L = JSON.parse(bridge.lockInfo()); } catch (e) { return null; }
+  const push = () => { bridge.setLock(!!L.enabled, L.grace | 0, !!L.hideRecents); renderSettings(); };
+  const row = (label, sub, ctl) => h('div', { class: 'row', style: 'min-height:56px' }, h('div', { class: 'grow' }, h('div', null, label), sub ? h('div', { class: 'dim small' }, sub) : null), ctl);
+  const sw = (on, fn) => { const cb = h('input', { type: 'checkbox', checked: on, onchange: () => fn(cb.checked) }); return h('label', { class: 'switch' }, cb, h('i')); };
+  const grace = h('select', { style: 'width:auto;min-width:150px', onchange: () => { L.grace = +grace.value; push(); } },
+    [[0, 'Immediately'], [60, 'After 1 minute'], [300, 'After 5 minutes'], [900, 'After 15 minutes']].map(([v, t]) => h('option', { value: v }, t)));
+  grace.value = String(L.grace | 0);
+  return [
+    h('h2', null, 'Privacy'),
+    h('div', { class: 'card' },
+      L.problem ? h('div', { class: 'note bad' }, L.problem) : null,
+      row('Lock the app', 'Fingerprint, or your phone PIN as a backup', sw(!!L.enabled, v => { L.enabled = v; push(); })),
+      L.enabled ? row('Lock when returning', 'Time away before it asks again', grace) : null,
+      row('Hide in recent apps', 'Shows a blank card instead of the screen', sw(!!L.hideRecents, v => { L.hideRecents = v; push(); })),
+      L.enabled && !L.problem ? h('button', { class: 'btn block', style: 'margin-top:8px', onclick: () => bridge.lockNow() }, 'Lock now') : null),
+  ];
 }
 function serverSheet(sv) {
   const name = h('input', { type: 'text', value: sv ? sv.name : '', placeholder: 'e.g. Main rig', autocomplete: 'off' });
