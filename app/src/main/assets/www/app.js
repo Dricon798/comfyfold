@@ -61,7 +61,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) saveN
 const R = {
   tab: 'edit', oi: null, connected: false, connecting: false, connErr: null, stats: null,
   ws: null, wsRetry: 0, gen: 0,
-  queue: { running: [], pending: [] }, history: [], remote: [], mine: new Set(),
+  queue: { running: [], pending: [] }, history: [], remote: [], features: {}, assets: { items: [], cursor: null, more: false, loading: false, ok: false }, mine: new Set(),
   prog: null, previewUrl: null, results: [], shown: 0, fieldErrs: {},
 };
 const curServer = () => S.servers.find(s => s.id === S.activeServer) || null;
@@ -133,7 +133,7 @@ async function connect() {
   const gen = ++R.gen;
   if (R.ws) { try { R.ws.onclose = null; R.ws.close(); } catch (e) {} R.ws = null; }
   R.connected = false; R.oi = null; R.stats = null; R.connErr = null; R.prog = null;
-  R.queue = { running: [], pending: [] }; R.history = []; R.remote = []; R.results = []; R.shown = 0; setPreview(null);
+  R.queue = { running: [], pending: [] }; R.history = []; R.remote = []; R.features = {}; R.assets = { items: [], cursor: null, more: false, loading: false, ok: false }; R.results = []; R.shown = 0; setPreview(null);
   if (!curServer()) { R.connecting = false; renderAll(); return; }
   R.connecting = true; renderAll();
   try {
@@ -145,8 +145,10 @@ async function connect() {
     if (gen !== R.gen) return;
     if (oi.status !== 200 || !oi.data || typeof oi.data !== 'object') throw new Error('could not load node list (HTTP ' + oi.status + ')');
     R.oi = oi.data; R.connected = true; R.connecting = false;
+    try { const f = await api('GET', '/features'); if (f.status === 200 && f.data && typeof f.data === 'object') R.features = f.data; } catch (e) { /* older server */ }
+    if (gen !== R.gen) return;
     openWs(gen);
-    await Promise.all([refreshQueue(), refreshHistory(), refreshRemote().catch(() => {})]);
+    await Promise.all([refreshQueue(), refreshHistory(), refreshRemote().catch(() => {}), refreshAssets(false).catch(() => {})]);
   } catch (e) {
     if (gen !== R.gen) return;
     R.connecting = false; R.connErr = e.message;
@@ -248,7 +250,46 @@ async function refreshHistory() {
   if (R.tab === 'gallery') renderGallery();
 }
 const refreshQueueSoon = debounce(() => refreshQueue().catch(() => {}), 250);
-const refreshHistorySoon = debounce(() => refreshHistory().catch(() => {}), 500);
+const refreshHistorySoon = debounce(() => { refreshHistory().catch(() => {}); if (R.features.assets) setTimeout(() => refreshAssets(false).catch(() => {}), 1500); }, 500);
+
+// ---------- saved outputs (ComfyUI assets system: persists across restarts, includes subfolders) ----------
+const ASSET_PAGE = 120;
+function assetToMedia(a) {
+  let filename = null, subfolder = '', type = null;
+  if (typeof a.preview_url === 'string' && a.preview_url.includes('?')) {
+    const q = new URLSearchParams(a.preview_url.slice(a.preview_url.indexOf('?') + 1));
+    if (q.get('filename')) { filename = q.get('filename'); subfolder = q.get('subfolder') || ''; type = q.get('type'); }
+  }
+  if (!filename) {
+    const rel = String(a.display_name || a.name || '').replace(/\\/g, '/'); const i = rel.lastIndexOf('/');
+    filename = i >= 0 ? rel.slice(i + 1) : rel; subfolder = i >= 0 ? rel.slice(0, i) : '';
+  }
+  if (!type) type = ['output', 'temp', 'input'].find(t => (a.tags || []).includes(t)) || 'output';
+  const mime = a.mime_type || (a.metadata && a.metadata.content_type) || '';
+  return { filename, subfolder, type, pid: a.job_id || a.prompt_id || null, video: /^video\//.test(mime) || isVideo(filename), asset: true };
+}
+async function refreshAssets(more) {
+  if (!R.features.assets || R.assets.loading) return;
+  if (more && !R.assets.cursor) return;
+  R.assets.loading = true;
+  try {
+    let q = '/api/assets?tags_any=output&sort=created_at&order=desc&limit=' + ASSET_PAGE;
+    if (more) q += '&after=' + encodeURIComponent(R.assets.cursor);
+    const r = await api('GET', q);
+    if (r.status !== 200 || !r.data || !Array.isArray(r.data.assets)) { R.assets.ok = false; return; }
+    const items = r.data.assets.filter(a => !/^(image|video)\//.test(a.mime_type || '') ? isImageName(a.name) || isVideo(a.name) : true).map(assetToMedia);
+    R.assets.items = more ? R.assets.items.concat(items) : items;
+    R.assets.cursor = r.data.next_cursor || null; R.assets.more = !!r.data.has_more && !!R.assets.cursor; R.assets.ok = true;
+  } finally { R.assets.loading = false; if (R.tab === 'gallery') renderGallery(); }
+}
+// newest runs from history first, then everything the assets system knows about, without duplicates
+function galleryItems() {
+  const seen = new Set(), all = [];
+  const add = m => { const k = m.type + '|' + m.subfolder + '|' + m.filename; if (!seen.has(k)) { seen.add(k); all.push(m); } };
+  for (const e of R.history) for (const m of e.media) if (m.type !== 'temp') add(m);
+  for (const m of R.assets.items) add(m);
+  return all;
+}
 
 // ---------- workflow model ----------
 const isLink = v => Array.isArray(v) && v.length === 2 && (typeof v[0] === 'string' || typeof v[0] === 'number') && typeof v[1] === 'number';
@@ -522,7 +563,7 @@ function switchTab(id) {
   R.tab = id;
   for (const [t] of TABS) $('#v-' + t).hidden = t !== id;
   renderTabs(); renderTab(); updateRun();
-  if (id === 'gallery' && R.connected) refreshHistory().catch(() => {});
+  if (id === 'gallery' && R.connected) { refreshHistory().catch(() => {}); refreshAssets(false).catch(() => {}); }
   if (id === 'queue' && R.connected) refreshQueue().catch(() => {});
 }
 function renderTab() { ({ workflows: renderWorkflows, edit: renderEdit, queue: renderQueue, gallery: renderGallery, settings: renderSettings })[R.tab](); }
@@ -742,7 +783,7 @@ function imageEl(wf, key, info, v, set) {
 const isImageName = n => /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(String(n));
 function pickImageSheet(options, cb) {
   const inputs = options.filter(isImageName).map(o => Object.assign(parseImageRef(o), { ref: o }));
-  const outputs = []; for (const e of R.history) for (const m of e.media) if (!m.video) outputs.push(Object.assign({ ref: outputRef(m) }, m));
+  const outputs = galleryItems().filter(m => !m.video).map(m => Object.assign({ ref: outputRef(m) }, m));
   const grid = h('div', { class: 'grid' }); const seg = h('div', { class: 'seg' });
   const show = which => {
     seg.textContent = ''; grid.textContent = '';
@@ -838,12 +879,16 @@ function renderQueue() {
 
 // ---------- gallery tab ----------
 function renderGallery() {
-  const all = []; for (const e of R.history) for (const m of e.media) all.push(m);
+  const all = galleryItems();
+  const src = R.assets.ok ? 'All saved outputs' : (R.features.assets ? 'Run history (saved outputs unavailable)' : 'Run history since ComfyUI last started');
+  const refresh = () => Promise.all([refreshHistory(), refreshAssets(false)]).then(() => toast('Updated')).catch(e => toast(e.message, true));
   page('gallery',
-    h('div', { class: 'edit-head' }, h('h1', null, 'Gallery'), h('button', { class: 'btn icon', 'aria-label': 'Refresh', onclick: () => refreshHistory().then(() => toast('Updated')).catch(e => toast(e.message, true)) }, icon('refresh'))),
+    h('div', { class: 'edit-head' }, h('h1', null, 'Gallery'), h('button', { class: 'btn icon', 'aria-label': 'Refresh', onclick: refresh }, icon('refresh'))),
+    R.connected ? h('div', { class: 'dim small', style: 'margin:-4px 2px 10px' }, src + (all.length ? ' · ' + all.length + (R.assets.more ? '+' : '') : '')) : null,
     all.length ? h('div', { class: 'grid' }, all.map((m, i) => h('div', { class: 'cell', onclick: () => openViewer(all, i) },
       m.video ? [h('div', { class: 'vid' }, m.filename), h('div', { class: 'play' }, 'video')] : h('img', { src: viewUrl(m, true), loading: 'lazy', alt: m.filename }))))
-      : h('div', { class: 'empty' }, R.connected ? 'No outputs in the server history yet.' : 'Not connected.'));
+      : h('div', { class: 'empty' }, !R.connected ? 'Not connected.' : R.assets.loading ? 'Loading…' : 'No outputs found on the server.'),
+    R.assets.more ? h('button', { class: 'btn block', style: 'margin-top:12px', disabled: R.assets.loading, onclick: () => refreshAssets(true).catch(e => toast(e.message, true)) }, R.assets.loading ? 'Loading…' : 'Load more') : null);
 }
 
 // ---------- full-screen viewer with pinch zoom ----------
